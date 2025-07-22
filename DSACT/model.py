@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead
-from RLAlg.nn.steps import ValueStep, StochasticContinuousPolicyStep
+from RLAlg.nn.layers import make_mlp_layers, GaussianHead, DistributeCriticHead
+from RLAlg.nn.steps import DistributionStep, StochasticContinuousPolicyStep
 
 class Actor(nn.Module):
     def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None):
@@ -32,12 +32,12 @@ class QNet(nn.Module):
         #if norm is set true, the model will adapt layer norm
         self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
 
-        self.head = CriticHead(feature_dim)
+        self.head = DistributeCriticHead(feature_dim)
 
-    def forward(self, x:torch.Tensor) -> ValueStep:
+    def forward(self, x:torch.Tensor) -> DistributionStep:
         x = self.layers(x)
 
-        step:ValueStep = self.head(x)
+        step:DistributionStep = self.head(x)
 
         return step
     
@@ -48,10 +48,10 @@ class Critic(nn.Module):
         self.critic_1 = QNet(in_dim+action_dim, hidden_dims)
         self.critic_2 = QNet(in_dim+action_dim, hidden_dims)
 
-    def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[ValueStep, ValueStep]:
+    def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[DistributionStep, DistributionStep]:
         x = torch.cat([x, action], dim=1)
 
-        step_1:ValueStep = self.critic_1(x)
-        step_2:ValueStep = self.critic_2(x)
+        step_1:DistributionStep = self.critic_1(x)
+        step_2:DistributionStep = self.critic_2(x)
 
         return step_1, step_2

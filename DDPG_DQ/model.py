@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead
-from RLAlg.nn.steps import ValueStep, StochasticContinuousPolicyStep
+from RLAlg.nn.layers import make_mlp_layers, DeterministicHead, CriticHead
+from RLAlg.nn.steps import ValueStep, DeterministicContinuousPolicyStep
 
 class Actor(nn.Module):
     def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None):
@@ -16,16 +16,16 @@ class Actor(nn.Module):
 
         #if max action is setted, normal distribution will be scaled tanh transformed.
         #if state_dependent_std is True, log std will be learned from obs
-        self.head = GaussianHead(feature_dim, action_dim, max_action=max_action, state_dependent_std=False)
+        self.head = DeterministicHead(feature_dim, action_dim, max_action=max_action)
 
-    def forward(self, x:torch.Tensor, action:Optional[torch.Tensor]=None) -> StochasticContinuousPolicyStep:
+    def forward(self, x:torch.Tensor, std:float) -> DeterministicContinuousPolicyStep:
         x = self.layers(x)
 
-        step:StochasticContinuousPolicyStep = self.head(x, action)
+        step:DeterministicContinuousPolicyStep = self.head(x, std)
 
         return step
     
-class Critic(nn.Module):
+class QNet(nn.Module):
     def __init__(self, in_dim:int, hidden_dims:list[int]):
         super().__init__()
 
@@ -40,3 +40,18 @@ class Critic(nn.Module):
         step:ValueStep = self.head(x)
 
         return step
+    
+class Critic(nn.Module):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
+        super().__init__()
+        
+        self.critic_1 = QNet(in_dim+action_dim, hidden_dims)
+        self.critic_2 = QNet(in_dim+action_dim, hidden_dims)
+
+    def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[ValueStep, ValueStep]:
+        x = torch.cat([x, action], dim=1)
+
+        step_1:ValueStep = self.critic_1(x)
+        step_2:ValueStep = self.critic_2(x)
+
+        return step_1, step_2
