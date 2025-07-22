@@ -11,11 +11,24 @@ import numpy as np
 from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
+from RLAlg.utils import set_seed_everywhere
 
 from model import Actor, Critic
 
 class Trainer:
-    def __init__(self, env_name:str, env_num:int):
+    def __init__(self, env_name:str, env_num:int, seed:int=0):
+        self.seed = seed
+        set_seed_everywhere(self.seed)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.env_name = env_name
+        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+
+        self.max_steps = self.envs.envs[0].spec.max_episode_steps
+        self.rollout_steps = self.max_steps
+
+        max_action = torch.from_numpy(self.envs.single_action_space.high).float()
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -138,8 +151,8 @@ class Trainer:
                 self.optimizer.step()
                 
     def train(self, num_epoch:int, num_iteration:int, batch_size:int):
-        self.obs, _ = self.envs.reset()
-        
+        self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
+
         for _ in trange(num_epoch):
             self.rollout()
             self.update(num_iteration, batch_size)

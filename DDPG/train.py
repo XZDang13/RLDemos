@@ -11,14 +11,18 @@ import numpy as np
 from RLAlg.alg.ddpg import DDPG
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 from RLAlg.nn.steps import DeterministicContinuousPolicyStep, ValueStep
+from RLAlg.utils import set_seed_everywhere
 
 from model import Actor, Critic
 
 class Trainer:
-    def __init__(self, env_name:str, env_num:int):
+    def __init__(self, env_name:str, env_num:int, seed:int=0):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.seed = seed
         
+        set_seed_everywhere(self.seed)
+
         self.env_name = env_name
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
@@ -144,7 +148,7 @@ class Trainer:
             DDPG.update_target_param(self.critic, self.critic_target, self.tau)
                 
     def train(self, num_epoch:int, num_iteration:int, batch_size:int):
-        self.obs, _ = self.envs.reset()
+        self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
         random = True
         for i in trange(num_epoch):
             if i > (num_epoch // 10):

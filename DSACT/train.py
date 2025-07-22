@@ -11,11 +11,14 @@ import numpy as np
 from RLAlg.alg.dsact import DSACT
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DistributionStep
+from RLAlg.utils import set_seed_everywhere
 
 from model import Actor, Critic
 
 class Trainer:
-    def __init__(self, env_name:str, env_num:int):
+    def __init__(self, env_name:str, env_num:int, seed:int=0):
+        self.seed = seed
+        set_seed_everywhere(self.seed)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -137,7 +140,7 @@ class Trainer:
             DSACT.update_target_param(self.critic, self.critic_target, self.tau)
                 
     def train(self, num_epoch:int, num_iteration:int, batch_size:int):
-        self.obs, _ = self.envs.reset()
+        self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
         random = True
         for i in trange(num_epoch):
             if i > (num_epoch // 10):
