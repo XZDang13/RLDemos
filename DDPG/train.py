@@ -12,6 +12,7 @@ from RLAlg.alg.ddpg import DDPG
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 from RLAlg.nn.steps import DeterministicContinuousPolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
+from RLAlg.logger import WandbLogger
 
 from model import Actor, Critic
 
@@ -24,20 +25,27 @@ class Trainer:
         set_seed_everywhere(self.seed)
 
         self.env_name = env_name
+        self.env_num = env_num
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = self.max_steps
         self.max_buffer_steps = 100000
 
-        self.max_action = torch.from_numpy(self.envs.single_action_space.high).float()
+        self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
+        
+        obs_dim = np.prod(obs_space)
+        if isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete):
+            action_dim = self.envs.single_action_space.n
+        elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
+            action_dim = np.prod(self.envs.single_action_space.shape)
 
-        self.actor = Actor(np.prod(obs_space), np.prod(action_space), [128, 128], self.max_action)
-        self.critic = Critic(np.prod(obs_space), np.prod(action_space), [128, 128])
-        self.actor_target = Actor(np.prod(obs_space), np.prod(action_space), [128, 128], self.max_action)
-        self.critic_target = Critic(np.prod(obs_space), np.prod(action_space), [128, 128])
+        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
+        self.critic = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
+        self.actor_target = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
+        self.critic_target = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
         
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -66,6 +74,9 @@ class Trainer:
         self.tau = 0.005
         self.max_grad_norm = 1.0
         
+        self.global_step = 0
+        WandbLogger.init_project("RLDemos", f"DDPG-{env_name}-{seed}")
+        
         
     def setup_env(self, env_name:str, mode:Optional[str]=None) -> gymnasium.wrappers.RecordEpisodeStatistics:
         env = gymnasium.make(env_name, render_mode=mode)
@@ -87,15 +98,11 @@ class Trainer:
             
         return action.tolist()
     
-    def average_non_zero(self, numbers):
-        non_zero_numbers = [num for num in numbers if num != 0]
-        if not non_zero_numbers:
-            return 0  # Return 0 if there are no non-zero elements
-        return sum(non_zero_numbers) / len(non_zero_numbers)
-    
     def rollout(self, random:bool=False):
         obs = self.obs
         for i in range(self.rollout_steps):
+            self.global_step += self.env_num
+            
             action = self.get_action(obs, random)
             next_obs, reward, done, timeout, info = self.envs.step(action)
             
@@ -112,11 +119,19 @@ class Trainer:
             obs = next_obs
             
             if "episode" in info:
-                print(self.average_non_zero(info['episode']['r']))
+                finished = info['episode']['_r']
+                episode_info = {}
+                episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
+                episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
+                
+                WandbLogger.log_metrics(episode_info, self.global_step)
         
         self.obs = obs
         
     def update(self, num_iteration:int, batch_size:int):
+        policy_loss_buffer = []
+        critic_loss_buffer = []
+        
         for _ in range(num_iteration):
             batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
             obs_batch = batch["observations"].to(self.device)
@@ -136,8 +151,8 @@ class Trainer:
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss = DDPG.compute_actor_loss(self.actor, self.critic, obs_batch.detach(), self.regularization_weight)
-            actor_loss.backward()
+            policy_loss = DDPG.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.regularization_weight)
+            policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optimizer.step()
 
@@ -146,6 +161,19 @@ class Trainer:
 
             DDPG.update_target_param(self.actor, self.actor_target, self.tau)
             DDPG.update_target_param(self.critic, self.critic_target, self.tau)
+            
+            policy_loss_buffer.append(policy_loss.item())
+            critic_loss_buffer.append(critic_loss.item())
+            
+        avg_policy_loss = np.mean(policy_loss_buffer)
+        avg_critic_loss = np.mean(critic_loss_buffer)
+        
+        train_info = {
+            "update/avg_policy_loss": avg_policy_loss,
+            "update/avg_critic_loss": avg_critic_loss
+        }
+
+        WandbLogger.log_metrics(train_info, self.global_step)
                 
     def train(self, num_epoch:int, num_iteration:int, batch_size:int):
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])

@@ -12,8 +12,9 @@ from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
+from RLAlg.logger import WandbLogger
 
-from model import Actor, Critic
+from model import ContinuousActor, DiscreteActor, Critic
 
 class Trainer:
     def __init__(self, env_name:str, env_num:int, seed:int=0):
@@ -23,12 +24,11 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.env_name = env_name
+        self.env_num = env_num
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = self.max_steps
-
-        max_action = torch.from_numpy(self.envs.single_action_space.high).float()
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -38,12 +38,19 @@ class Trainer:
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = self.max_steps
 
-        max_action = torch.from_numpy(self.envs.single_action_space.high).float()
+        self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
+        
+        obs_dim = np.prod(obs_space)
+        if isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete):
+            action_dim = self.envs.single_action_space.n
+            self.actor = DiscreteActor(obs_dim, action_dim, [128, 128]).to(self.device)
+        elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
+            action_dim = np.prod(self.envs.single_action_space.shape)
+            self.actor = ContinuousActor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
 
-        self.actor = Actor(np.prod(obs_space), np.prod(action_space), [128, 128], max_action)
-        self.critic = Critic(np.prod(obs_space), [128, 128])
+        self.critic = Critic(obs_dim, [128, 128]).to(self.device)
         
         self.optimizer = optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
@@ -67,6 +74,9 @@ class Trainer:
         self.value_loss_weight = 0.5
         self.entropy_weight = 0.01
         
+        self.global_step = 0   
+        WandbLogger.init_project("RLDemos", f"PPO-{env_name}-{seed}")
+        
     def setup_env(self, env_name:str, mode:Optional[str]=None) -> gymnasium.wrappers.RecordEpisodeStatistics:
         env = gymnasium.make(env_name, render_mode=mode)
         env = gymnasium.wrappers.RecordEpisodeStatistics(env)
@@ -85,15 +95,10 @@ class Trainer:
         
         return action, log_prob, value
     
-    def average_non_zero(self, numbers):
-        non_zero_numbers = [num for num in numbers if num != 0]
-        if not non_zero_numbers:
-            return 0  # Return 0 if there are no non-zero elements
-        return sum(non_zero_numbers) / len(non_zero_numbers)
-    
     def rollout(self):
         obs = self.obs
         for i in range(self.rollout_steps):
+            self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
             next_obs, reward, done, timeout, info = self.envs.step(action)
             
@@ -111,8 +116,13 @@ class Trainer:
             obs = next_obs
             
             if "episode" in info:
-                print(self.average_non_zero(info['episode']['r']))
-        
+                finished = info['episode']['_r']
+                episode_info = {}
+                episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
+                episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
+                
+                WandbLogger.log_metrics(episode_info, self.global_step)
+                
         self.obs = obs
         _, _, value = self.get_action(obs)
         returns, advantages = compute_gae(
@@ -128,6 +138,11 @@ class Trainer:
         self.replay_buffer.add_storage("advantages", advantages)
         
     def update(self, num_iteration:int, batch_size:int):
+        policy_loss_buffer = []
+        value_loss_buffer = []
+        entropy_buffer = []
+        kl_divergence_buffer = []
+        
         for _ in range(num_iteration):
             for batch in self.replay_buffer.sample_batchs(self.batch_keys, batch_size):
                 obs_batch = batch["observations"].to(self.device)
@@ -149,6 +164,26 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                
+                policy_loss_buffer.append(policy_loss.item())
+                value_loss_buffer.append(value_loss.item())
+                entropy_buffer.append(entropy.item())
+                kl_divergence_buffer.append(kl_divergence.item())
+                
+        avg_policy_loss = np.mean(policy_loss_buffer)
+        avg_value_loss = np.mean(value_loss_buffer)
+        avg_entropy = np.mean(entropy_buffer)
+        avg_kl_divergence = np.mean(kl_divergence_buffer)
+        
+        train_info = {
+            "update/avg_policy_loss": avg_policy_loss,
+            "update/avg_value_loss": avg_value_loss,
+            "update/avg_entropy": avg_entropy,
+            "update/avg_kl_divergence": avg_kl_divergence
+        }
+
+        WandbLogger.log_metrics(train_info, self.global_step)
+            
                 
     def train(self, num_epoch:int, num_iteration:int, batch_size:int):
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
