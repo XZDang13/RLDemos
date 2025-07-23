@@ -34,11 +34,10 @@ class DiscreteActor(nn.Module):
 
         self.head = CategoricalHead(feature_dim, action_dim)
 
-    def forward(self, x:torch.Tensor) -> DiscretePolicyStep:
+    def forward(self, x:torch.Tensor, action:Optional[torch.Tensor]=None) -> DiscretePolicyStep:
         x = self.layers(x)
 
-        logits = self.head(x)
-        step:DiscretePolicyStep = DiscretePolicyStep(logits=logits)
+        step:DiscretePolicyStep = self.head(x, action)
 
         return step
     

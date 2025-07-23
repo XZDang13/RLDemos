@@ -38,7 +38,6 @@ class Trainer:
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = self.max_steps
 
-        self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
         
@@ -47,6 +46,7 @@ class Trainer:
             action_dim = self.envs.single_action_space.n
             self.actor = DiscreteActor(obs_dim, action_dim, [128, 128]).to(self.device)
         elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
+            self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
             action_dim = np.prod(self.envs.single_action_space.shape)
             self.actor = ContinuousActor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
 
