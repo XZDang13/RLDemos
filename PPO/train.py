@@ -194,6 +194,6 @@ class Trainer:
         
         
 if __name__ == "__main__":
-    trainer = Trainer("HalfCheetah-v5", 20)
+    trainer = Trainer("HalfCheetah-v5", 20, seed=100)
     
     trainer.train(num_epoch=100, num_iteration=10, batch_size=500)

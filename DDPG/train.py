@@ -144,7 +144,6 @@ class Trainer:
             critic_loss = DDPG.compute_critic_loss(self.actor_target, self.critic, self.critic_target,
                                                    obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, self.gamma)
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic_optimizer.step()
 
             for param in self.critic.parameters():
@@ -153,7 +152,6 @@ class Trainer:
             self.actor_optimizer.zero_grad(set_to_none=True)
             policy_loss = DDPG.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.regularization_weight)
             policy_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optimizer.step()
 
             for param in self.critic.parameters():
@@ -186,6 +184,6 @@ class Trainer:
         
         
 if __name__ == "__main__":
-    trainer = Trainer("HalfCheetah-v5", 20)
+    trainer = Trainer("HalfCheetah-v5", 20, seed=0)
     
     trainer.train(num_epoch=100, num_iteration=250, batch_size=500)
