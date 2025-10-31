@@ -78,7 +78,7 @@ class Trainer:
         self.expert_buffer = ReplayBuffer(env_num, 1000, device=self.device)
         self.expert_buffer.load("AMP/HalfCheetah-v5_expert_data.pth", device=self.device)
 
-        self.agent_buffer = ReplayBuffer(env_num, 1000, device=self.device)
+        self.agent_buffer = ReplayBuffer(env_num, 2000, device=self.device)
         self.agent_buffer.create_storage_space("observations", obs_space, torch.float32)
         self.agent_buffer.create_storage_space("next_observations", obs_space, torch.float32)
         
@@ -205,17 +205,21 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.ac_optimizer.step()
 
-                expert_batch = self.expert_buffer.sample_batch(["observations", "next_observations"], batch_size)
+                expert_batch = self.expert_buffer.sample_batch(["observations", "next_observations"], 64)
                 expert_obs_batch = expert_batch["observations"].to(self.device)
                 expert_next_batch = expert_batch["next_observations"].to(self.device)
+
+                agent_current_batch = self.replay_buffer.sample_batch(["observations", "next_observations"], 64)
+                agent_current_obs_batch = agent_current_batch["observations"].to(self.device)
+                agent_current_next_batch = agent_current_batch["next_observations"].to(self.device)
                 
-                agent_history_batch = self.agent_buffer.sample_batch(["observations", "next_observations"], batch_size)
+                agent_history_batch = self.agent_buffer.sample_batch(["observations", "next_observations"], 64)
                 agent_history_obs_batch = agent_history_batch["observations"].to(self.device)
-                agent_history_next_batch = agent_history_batch["next_observations"].to(self.device)
+                agent_history_next_obs_batch = agent_history_batch["next_observations"].to(self.device)
 
                 expert_d_obs_batch = torch.cat([expert_obs_batch, expert_next_batch], dim=1)
-                agent_d_current_obs_batch = torch.cat([obs_batch, next_obs_batch], dim=1)
-                agent_d_history_obs_batch = torch.cat([agent_history_obs_batch, agent_history_next_batch], dim=1)
+                agent_d_current_obs_batch = torch.cat([agent_current_obs_batch, agent_current_next_batch], dim=1)
+                agent_d_history_obs_batch = torch.cat([agent_history_obs_batch, agent_history_next_obs_batch], dim=1)
                 agent_d_obs_batch = torch.cat([agent_d_current_obs_batch, agent_d_history_obs_batch], dim=0)
 
                 d_loss = GAN.compute_bce_loss(self.discriminator, expert_d_obs_batch, agent_d_obs_batch, r1_gamma=5.0)
