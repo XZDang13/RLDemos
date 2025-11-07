@@ -171,11 +171,16 @@ class Trainer:
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss, entropy, kl_divergence = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
- 
+                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
 
-                value_loss = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
+                policy_loss = policy_loss_dict["loss"]
+                entropy = policy_loss_dict["entropy"]
+                kl_divergence = policy_loss_dict["kl_divergence"]
+
+                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
                 
+                value_loss = value_loss_dict["loss"]
+
                 ac_loss = policy_loss + value_loss * self.value_loss_weight - entropy * self.entropy_weight
 
                 self.ac_optimizer.zero_grad()
@@ -191,7 +196,13 @@ class Trainer:
                 expert_d_obs_batch = torch.cat([expert_obs_batch, expert_action_batch], dim=1)
                 agent_d_obs_batch = torch.cat([obs_batch, action_batch], dim=1)
 
-                d_loss = GAN.compute_bce_loss(self.discriminator, expert_d_obs_batch, agent_d_obs_batch, r1_gamma=5.0)
+                d_loss_dict = GAN.compute_bce_loss(self.discriminator, expert_d_obs_batch, agent_d_obs_batch, r1_gamma=5.0)
+                
+                d_loss = d_loss_dict["loss"]
+                d_loss_real = d_loss_dict["loss_real"]
+                d_loss_fake = d_loss_dict["loss_fake"]
+                d_loss_gp = d_loss_dict["gradient_penalty"]
+                
                 self.d_optimizer.zero_grad()
                 d_loss.backward()
                 self.d_optimizer.step()

@@ -125,6 +125,9 @@ class Trainer:
     def update(self, num_iteration:int, batch_size:int):
         policy_loss_buffer = []
         critic_loss_buffer = []
+        q1_buffer = []
+        q2_buffer = []
+        q_target_buffer = []
         
         for _ in range(num_iteration):
             batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
@@ -135,8 +138,12 @@ class Trainer:
             done_batch = batch["dones"].to(self.device)
             
             self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss = DDPGDoubleQ.compute_critic_loss(self.actor, self.critic, self.critic_target,
+            critic_loss_dict = DDPGDoubleQ.compute_critic_loss(self.actor, self.critic, self.critic_target,
                                                    obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, self.gamma)
+            critic_loss = critic_loss_dict["loss"]
+            q1 = critic_loss_dict["q1"]
+            q2 = critic_loss_dict["q2"]
+            q_target = critic_loss_dict["q_target"]
             critic_loss.backward()
             self.critic_optimizer.step()
 
@@ -144,7 +151,8 @@ class Trainer:
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            policy_loss = DDPGDoubleQ.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.std, self.regularization_weight)
+            policy_loss_dict = DDPGDoubleQ.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.std, self.regularization_weight)
+            policy_loss = policy_loss_dict["loss"]
             policy_loss.backward()
             self.actor_optimizer.step()
 
@@ -155,13 +163,22 @@ class Trainer:
             
             policy_loss_buffer.append(policy_loss.item())
             critic_loss_buffer.append(critic_loss.item())
+            q1_buffer.append(q1.item())
+            q2_buffer.append(q2.item())
+            q_target_buffer.append(q_target.item())
             
         avg_policy_loss = np.mean(policy_loss_buffer)
         avg_critic_loss = np.mean(critic_loss_buffer)
+        avg_q1 = np.mean(q1_buffer)
+        avg_q2 = np.mean(q2_buffer)
+        avg_q_target = np.mean(q_target_buffer)
         
         train_info = {
             "update/avg_policy_loss": avg_policy_loss,
-            "update/avg_critic_loss": avg_critic_loss
+            "update/avg_critic_loss": avg_critic_loss,
+            "update/avg_q1": avg_q1,
+            "update/avg_q2": avg_q2,
+            "update/avg_q_target": avg_q_target,
         }
 
         WandbLogger.log_metrics(train_info, self.global_step)

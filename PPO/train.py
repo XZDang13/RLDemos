@@ -150,11 +150,16 @@ class Trainer:
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss, entropy, kl_divergence = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
- 
+                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
 
-                value_loss = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
+                policy_loss = policy_loss_dict["loss"]
+                entropy = policy_loss_dict["entropy"]
+                kl_divergence = policy_loss_dict["kl_divergence"]
+
+                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
                 
+                value_loss = value_loss_dict["loss"]
+
                 loss = policy_loss + value_loss * self.value_loss_weight - entropy * self.entropy_weight
 
                 self.optimizer.zero_grad()
