@@ -12,7 +12,7 @@ from RLAlg.alg.dsact import DSACT
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DistributionStep
 from RLAlg.utils import set_seed_everywhere
-from RLAlg.logger import WandbLogger
+from RLAlg.logger import WandbLogger, MetricsTracker
 
 from model import Actor, Critic
 
@@ -89,7 +89,7 @@ class Trainer:
         else:
             action = actor_step.action
             
-        return action.tolist()
+        return action
     
     def rollout(self, random:bool=False):
         obs = self.obs
@@ -97,7 +97,7 @@ class Trainer:
             self.global_step += self.env_num
             
             action = self.get_action(obs, random)
-            next_obs, reward, done, timeout, info = self.envs.step(action)
+            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
             
             record = {
                 "observations": obs,

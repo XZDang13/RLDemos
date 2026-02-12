@@ -13,7 +13,8 @@ from RLAlg.alg.gan import GAN
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
-from RLAlg.logger import WandbLogger
+from RLAlg.logger import WandbLogger,MetricsTracker
+
 
 from model import ContinuousActor, DiscreteActor, Critic, Discriminator
 
@@ -107,9 +108,9 @@ class Trainer:
         actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(obs)
         value_step:ValueStep = self.critic(obs)
         
-        action = actor_step.action.tolist()
-        log_prob = actor_step.log_prob.tolist()
-        value = value_step.value.tolist()
+        action = actor_step.action
+        log_prob = actor_step.log_prob
+        value = value_step.value
         
         
         return action, log_prob, value
@@ -120,7 +121,7 @@ class Trainer:
         d_obs = torch.cat([obs, next_obs], dim=1)
         style_reward_step = self.discriminator(d_obs)
 
-        style_reward = (-torch.log(1-1/(1+torch.exp(-style_reward_step.value))+1e-5)).tolist()
+        style_reward = (-torch.log(1-1/(1+torch.exp(-style_reward_step.value))+1e-5))
 
         return style_reward
     
@@ -130,7 +131,7 @@ class Trainer:
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
-            next_obs, task_reward, done, timeout, info = self.envs.step(action)
+            next_obs, task_reward, done, timeout, info = self.envs.step(action.numpy())
             style_reward = self.get_style_reward(obs, next_obs)
             
             record = {

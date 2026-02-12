@@ -40,34 +40,32 @@ class Trainer:
         action_space = self.envs.single_action_space.shape
         
         obs_dim = np.prod(obs_space)
-        self.encoder = Encoder(obs_dim, [128, 128]).to(self.device)
         
-        self.hidden = torch.zeros(env_num, self.encoder.feature_dim).to(self.device)
-        
+        self.actor_encoder = Encoder(obs_dim, [128, 128]).to(self.device)
+        self.critic_encoder = Encoder(obs_dim, [128, 128]).to(self.device)
         if isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete):
             action_dim = self.envs.single_action_space.n
-            self.actor = DiscreteActor(self.encoder.feature_dim, action_dim, [128, 128]).to(self.device)
+            self.actor = DiscreteActor(self.actor_encoder.feature_dim, action_dim, [128, 128]).to(self.device)
         elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
             self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
             action_dim = np.prod(self.envs.single_action_space.shape)
-            self.actor = ContinuousActor(self.encoder.feature_dim, action_dim, [128, 128], self.max_action).to(self.device)
+            self.actor = ContinuousActor(self.actor_encoder.feature_dim, action_dim, [128, 128], self.max_action).to(self.device)
 
-        self.critic = Critic(self.encoder.feature_dim, [128, 128]).to(self.device)
+        self.critic = Critic(self.critic_encoder.feature_dim, [128, 128]).to(self.device)
         
         self.optimizer = optim.Adam(
-           list(self.encoder.parameters()) + list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
+            list(self.actor_encoder.parameters()) + list(self.critic_encoder.parameters()) + list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
         )
         
         self.replay_buffer = ReplayBuffer(env_num, self.max_steps, device=self.device)
         self.replay_buffer.create_storage_space("observations", obs_space, torch.float32)
-        self.replay_buffer.create_storage_space("hiddens", (self.encoder.feature_dim,), torch.float32)
         self.replay_buffer.create_storage_space("actions", action_space, torch.float32)
         self.replay_buffer.create_storage_space("log_probs", (), torch.float32)
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
         self.replay_buffer.create_storage_space("values", (), torch.float32)
         self.replay_buffer.create_storage_space("dones", (), torch.float32)
         
-        self.batch_keys = ["observations", "hiddens", "actions", "log_probs", "rewards", "values", "returns", "advantages"]
+        self.batch_keys = ["observations", "actions", "log_probs", "rewards", "values", "returns", "advantages"]
         
         self.gamma = 0.99
         self.lambda_ = 0.95
@@ -89,26 +87,26 @@ class Trainer:
     @torch.no_grad()
     def get_action(self, obs:np.ndarray):
         obs = torch.from_numpy(obs).float().to(self.device)
-        feat = self.encoder(obs, self.hidden)
-        actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(feat)
-        value_step:ValueStep = self.critic(feat)
+        actor_feat = self.actor_encoder(obs)
+        critic_feat = self.critic_encoder(obs)
+        actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(actor_feat)
+        value_step:ValueStep = self.critic(critic_feat)
         
         action = actor_step.action
         log_prob = actor_step.log_prob
         value = value_step.value
         
-        return action, log_prob, value, feat
+        return action, log_prob, value
     
     def rollout(self):
         obs = self.obs
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
-            action, log_prob, value, next_hidden = self.get_action(obs)
+            action, log_prob, value = self.get_action(obs)
             next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
             
             record = {
                 "observations": obs,
-                "hiddens": self.hidden,
                 "actions": action,
                 "log_probs": log_prob,
                 "rewards": reward,
@@ -119,11 +117,9 @@ class Trainer:
             self.replay_buffer.add_records(record)
             
             obs = next_obs
-            self.hidden = next_hidden
             
             if "episode" in info:
                 finished = info['episode']['_r']
-                self.hidden[finished] = torch.zeros_like(self.hidden[finished])
                 episode_info = {}
                 episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
                 episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
@@ -131,7 +127,7 @@ class Trainer:
                 WandbLogger.log_metrics(episode_info, self.global_step)
                 
         self.obs = obs
-        _, _, value, _ = self.get_action(obs)
+        _, _, value = self.get_action(obs)
         returns, advantages = compute_gae(
             self.replay_buffer.data["rewards"],
             self.replay_buffer.data["values"],
@@ -153,25 +149,31 @@ class Trainer:
         for _ in range(num_iteration):
             for batch in self.replay_buffer.sample_batchs(self.batch_keys, batch_size):
                 obs_batch = batch["observations"].to(self.device)
-                hidden_batch = batch["hiddens"].to(self.device)
                 action_batch = batch["actions"].to(self.device)
                 log_prob_batch = batch["log_probs"].to(self.device)
                 value_batch = batch["values"].to(self.device)
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                feat_batch = self.encoder(obs_batch, hidden_batch)
+                actor_feat_batch = self.actor_encoder(obs_batch)
+                critic_feat_batch = self.critic_encoder(obs_batch)
                 
-                policy_loss, entropy, kl_divergence = PPO.compute_policy_loss(self.actor, log_prob_batch, feat_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
- 
+                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_prob_batch, actor_feat_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
 
-                value_loss = PPO.compute_clipped_value_loss(self.critic, feat_batch, value_batch, return_batch, self.clip_ratio)
+                policy_loss = policy_loss_dict["loss"]
+                entropy = policy_loss_dict["entropy"]
+                kl_divergence = policy_loss_dict["kl_divergence"]
+
+                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, critic_feat_batch, value_batch, return_batch, self.clip_ratio)
+                
+                value_loss = value_loss_dict["loss"]
                 
                 loss = policy_loss + value_loss * self.value_loss_weight - entropy * self.entropy_weight
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.actor_encoder.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.critic_encoder.parameters(), self.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()

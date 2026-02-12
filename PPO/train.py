@@ -12,7 +12,7 @@ from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
-from RLAlg.logger import WandbLogger
+from RLAlg.logger import WandbLogger, MetricsTracker
 
 from model import ContinuousActor, DiscreteActor, Critic
 
@@ -87,9 +87,9 @@ class Trainer:
         actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(obs)
         value_step:ValueStep = self.critic(obs)
         
-        action = actor_step.action.tolist()
-        log_prob = actor_step.log_prob.tolist()
-        value = value_step.value.tolist()
+        action = actor_step.action
+        log_prob = actor_step.log_prob
+        value = value_step.value
         
         return action, log_prob, value
     
@@ -98,7 +98,7 @@ class Trainer:
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
-            next_obs, reward, done, timeout, info = self.envs.step(action)
+            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
             
             record = {
                 "observations": obs,

@@ -8,22 +8,22 @@ import torch.optim as optim
 import gymnasium
 import numpy as np
 
-from RLAlg.alg.ddpg import DDPG
+from RLAlg.alg.sac import SAC
 from RLAlg.buffer.replay_buffer import ReplayBuffer
-from RLAlg.nn.steps import DeterministicContinuousPolicyStep, ValueStep
+from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger, MetricsTracker
 
-from model import Actor, Critic
+from model import Actor, Critic, Encoder
 
 class Trainer:
     def __init__(self, env_name:str, env_num:int, seed:int=0):
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.seed = seed
-        
         set_seed_everywhere(self.seed)
 
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
         self.env_name = env_name
         self.env_num = env_num
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
@@ -42,22 +42,24 @@ class Trainer:
         elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
             action_dim = np.prod(self.envs.single_action_space.shape)
 
-        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
-        self.actor_target = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
+        self.actor_encoder = Encoder(obs_dim, [128, 128]).to(self.device)
+        self.actor = Actor(self.actor_encoder.feature_dim, action_dim, [128, 128], self.max_action).to(self.device)
+        self.critic_encoder = Encoder(obs_dim, [128, 128]).to(self.device)
+        self.critic = Critic(self.critic_encoder.feature_dim, action_dim, [128, 128]).to(self.device)
+        self.critic_target_encoder = Encoder(obs_dim, [128, 128]).to(self.device)
+        self.critic_target = Critic(self.critic_target_encoder.feature_dim, action_dim, [128, 128]).to(self.device)
         
-        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target_encoder.load_state_dict(self.critic_encoder.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        for param in self.actor_target.parameters():
+        for param in self.critic_target_encoder.parameters():
             param.requires_grad = False
-            
+        
         for param in self.critic_target.parameters():
             param.requires_grad = False
 
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
+        self.actor_optimizer = optim.Adam(list(self.actor_encoder.parameters()) + list(self.actor.parameters()), lr=3e-4)
+        self.critic_optimizer = optim.Adam(list(self.critic_encoder.parameters()) + list(self.critic.parameters()), lr=3e-4)
         
         self.replay_buffer = ReplayBuffer(env_num, self.max_buffer_steps, device=self.device)
         self.replay_buffer.create_storage_space("observations", obs_space, torch.float32)
@@ -75,7 +77,7 @@ class Trainer:
         self.max_grad_norm = 1.0
         
         self.global_step = 0
-        WandbLogger.init_project("RLDemos", f"DDPG-{env_name}-{seed}")
+        WandbLogger.init_project("RLDemos", f"SAC-{env_name}-{seed}")
         
         
     def setup_env(self, env_name:str, mode:Optional[str]=None) -> gymnasium.wrappers.RecordEpisodeStatistics:
@@ -87,14 +89,13 @@ class Trainer:
     @torch.no_grad()
     def get_action(self, obs:np.ndarray, random:bool=False):
         obs = torch.from_numpy(obs).float().to(self.device)
-        actor_step:DeterministicContinuousPolicyStep  = self.actor(obs)
+        feat = self.actor_encoder(obs)
+        actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(feat)
         
         if random:
-            action = actor_step.mean.uniform_(-1, 1) * self.max_action
+            action = actor_step.action.uniform_(-1, 1) * self.max_action
         else:
-            action = actor_step.mean
-            action += torch.randn_like(action) * 0.1
-            action = torch.clamp(action, -self.max_action, self.max_action)
+            action = actor_step.action
             
         return action
     
@@ -131,7 +132,8 @@ class Trainer:
     def update(self, num_iteration:int, batch_size:int):
         policy_loss_buffer = []
         critic_loss_buffer = []
-        q_buffer = []
+        q1_buffer = []
+        q2_buffer = []
         q_target_buffer = []
         
         for _ in range(num_iteration):
@@ -143,43 +145,78 @@ class Trainer:
             done_batch = batch["dones"].to(self.device)
             
             self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss_dict = DDPG.compute_critic_loss(self.actor_target, self.critic, self.critic_target,
-                                                   obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, self.gamma)
+            critic_feat_batch = self.critic_encoder(obs_batch)
+            
+            with torch.no_grad():
+                next_actor_feat_batch = self.actor_encoder(next_obs_batch)
+                next_critic_feat_batch = self.critic_target_encoder(next_obs_batch)
+            critic_loss_dict = SAC.compute_critic_loss_asymmetric(
+                self.actor,
+                self.critic,
+                self.critic_target,
+                critic_feat_batch,
+                action_batch,
+                reward_batch,
+                next_actor_feat_batch,
+                next_critic_feat_batch,
+                done_batch,
+                self.alpha,
+                self.gamma
+            )
+            
             critic_loss = critic_loss_dict["loss"]
-            q = critic_loss_dict["q"]
+            q1 = critic_loss_dict["q1"]
+            q2 = critic_loss_dict["q2"]
             q_target = critic_loss_dict["q_target"]
+            
             critic_loss.backward()
+            #torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic_optimizer.step()
 
+            for param in self.critic_encoder.parameters():
+                param.requires_grad = False
+                
             for param in self.critic.parameters():
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            policy_loss_dict = DDPG.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.regularization_weight)
+            
+            actor_feat_batch = self.actor_encoder(obs_batch)
+            critic_feat_batch = self.critic_encoder(obs_batch)
+            
+            policy_loss_dict = SAC.compute_policy_loss_asymmetric(self.actor, self.critic, actor_feat_batch, critic_feat_batch, self.alpha, self.regularization_weight)
+            
             policy_loss = policy_loss_dict["loss"]
+            
             policy_loss.backward()
+            #torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optimizer.step()
 
+            for param in self.critic_encoder.parameters():
+                param.requires_grad = True
             for param in self.critic.parameters():
                 param.requires_grad = True
 
-            DDPG.update_target_param(self.actor, self.actor_target, self.tau)
-            DDPG.update_target_param(self.critic, self.critic_target, self.tau)
+            SAC.update_target_param(self.critic_encoder, self.critic_target_encoder, self.tau)
+            SAC.update_target_param(self.critic, self.critic_target, self.tau)
             
             policy_loss_buffer.append(policy_loss.item())
             critic_loss_buffer.append(critic_loss.item())
-            q_buffer.append(q.item())
+            q1_buffer.append(q1.item())
+            q2_buffer.append(q2.item())
             q_target_buffer.append(q_target.item())
-            
+
         avg_policy_loss = np.mean(policy_loss_buffer)
         avg_critic_loss = np.mean(critic_loss_buffer)
-        avg_q = np.mean(q_buffer)
+        avg_q1 = np.mean(q1_buffer)
+        avg_q2 = np.mean(q2_buffer)
         avg_q_target = np.mean(q_target_buffer)
         
         train_info = {
             "update/avg_policy_loss": avg_policy_loss,
             "update/avg_critic_loss": avg_critic_loss,
-            "update/avg_q": avg_q,
+            "update/avg_q1": avg_q1,
+            "update/avg_q2": avg_q2,
             "update/avg_q_target": avg_q_target,
         }
 
@@ -189,13 +226,14 @@ class Trainer:
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
         random = True
         for i in trange(num_epoch):
-            if i > (num_epoch // 10):
+            if i > (num_epoch // 5):
                 random = False
             self.rollout(random)
             self.update(num_iteration, batch_size)
         
         
 if __name__ == "__main__":
-    trainer = Trainer("HalfCheetah-v5", 20, seed=0)
+    trainer = Trainer("HalfCheetah-v5", 20, seed=100)
     
     trainer.train(num_epoch=100, num_iteration=250, batch_size=500)
+    
