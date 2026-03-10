@@ -31,7 +31,7 @@ class Trainer:
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        self.rollout_steps = self.max_steps
+        self.rollout_steps = 20
 
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
@@ -64,6 +64,7 @@ class Trainer:
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
         self.replay_buffer.create_storage_space("values", (), torch.float32)
         self.replay_buffer.create_storage_space("dones", (), torch.float32)
+        self.replay_buffer.create_storage_space("terminated", (), torch.float32)
         
         self.batch_keys = ["observations", "actions", "log_probs", "values", "returns", "advantages", "dones"]
         
@@ -113,7 +114,8 @@ class Trainer:
                 "log_probs": log_prob,
                 "rewards": reward,
                 "values": value,
-                "dones": done
+                "dones": done,
+                "terminated": terminate
             }
             
             self.replay_buffer.add_records(record)
@@ -123,12 +125,12 @@ class Trainer:
             done_tensor = torch.as_tensor(done, dtype=torch.bool, device=self.device)
             self.hidden[done_tensor] = torch.zeros_like(self.hidden[done_tensor])
             
-            if "episode" in info:
-                finished = info['episode']['_r']
+            if "episode" in info and "_episode" in info:
+                finished = info["_episode"]
                 if np.any(finished):
                     episode_info = {}
-                    episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
-                    episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
+                    episode_info["episode/mean_rewards"] = np.mean(info["episode"]["r"][finished])
+                    episode_info["episode/mean_length"] = np.mean(info["episode"]["l"][finished])
                     
                     WandbLogger.log_metrics(episode_info, self.global_step)
                 
@@ -137,7 +139,7 @@ class Trainer:
         returns, advantages = compute_gae(
             self.replay_buffer.data["rewards"],
             self.replay_buffer.data["values"],
-            self.replay_buffer.data["dones"],
+            self.replay_buffer.data["terminated"],
             value,
             self.gamma,
             self.lambda_

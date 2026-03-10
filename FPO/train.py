@@ -8,14 +8,14 @@ import torch.optim as optim
 import gymnasium
 import numpy as np
 
-from RLAlg.alg.ppo import PPO
+from RLAlg.alg.fpo import FPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.layers import NormPosition
-from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
+from RLAlg.nn.steps import FPOStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
-from RLAlg.logger import WandbLogger, MetricsTracker
+from RLAlg.logger import WandbLogger
 
-from model import ContinuousActor, DiscreteActor, Critic
+from model import Actor, Critic
 
 class Trainer:
     def __init__(self, env_name:str, env_num:int, seed:int=0):
@@ -30,20 +30,20 @@ class Trainer:
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = 20
+        self.flow_steps = 10
+        self.sample_per_action = 8
 
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
         
         obs_dim = np.prod(obs_space)
-        if isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete):
-            action_dim = self.envs.single_action_space.n
-            self.actor = DiscreteActor(obs_dim, action_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
-        elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
-            self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
-            action_dim = np.prod(self.envs.single_action_space.shape)
-            self.actor = ContinuousActor(obs_dim, action_dim, [128, 128], self.max_action, norm_position=NormPosition.PRE).to(self.device)
+        
+        self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
+        action_dim = np.prod(self.envs.single_action_space.shape)
+        self.action_dim = action_dim
+        self.actor = Actor(obs_dim, action_dim, 32, [128, 128], velocity_scale=0.25, norm_position=NormPosition.POST).to(self.device)
 
-        self.critic = Critic(obs_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
+        self.critic = Critic(obs_dim, [128, 128], norm_position=NormPosition.POST).to(self.device)
         
         self.optimizer = optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
@@ -52,23 +52,23 @@ class Trainer:
         self.replay_buffer = ReplayBuffer(env_num, self.rollout_steps, device=self.device)
         self.replay_buffer.create_storage_space("observations", obs_space, torch.float32)
         self.replay_buffer.create_storage_space("actions", action_space, torch.float32)
-        self.replay_buffer.create_storage_space("log_probs", (), torch.float32)
+        self.replay_buffer.create_storage_space("eps", (self.sample_per_action, action_dim), torch.float32)
+        self.replay_buffer.create_storage_space("time_step", (self.sample_per_action, 1), torch.float32)
+        self.replay_buffer.create_storage_space("init_cmf_loss", (self.sample_per_action,), torch.float32)
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
         self.replay_buffer.create_storage_space("values", (), torch.float32)
         self.replay_buffer.create_storage_space("terminated", (), torch.float32)
         
-        self.batch_keys = ["observations", "actions", "log_probs", "rewards", "values", "returns", "advantages"]
+        self.batch_keys = ["observations", "actions", "eps", "time_step", "init_cmf_loss",  "rewards", "values", "returns", "advantages"]
         
-        self.gamma = 0.99
+        self.gamma = 0.995
         self.lambda_ = 0.95
-        self.clip_ratio = 0.2
-        self.regularization_weight = 0.0
+        self.clip_ratio = 0.05
         self.max_grad_norm = 1.0
-        self.value_loss_weight = 0.5
-        self.entropy_weight = 0.01
+        self.value_loss_weight = 0.25
         
         self.global_step = 0   
-        WandbLogger.init_project("RLDemos", f"PPO-{env_name}-{seed}")
+        WandbLogger.init_project("RLDemos", f"FPO-{env_name}-{seed}")
         
     def setup_env(self, env_name:str, mode:Optional[str]=None) -> gymnasium.wrappers.RecordEpisodeStatistics:
         env = gymnasium.make(env_name, render_mode=mode)
@@ -79,25 +79,31 @@ class Trainer:
     @torch.no_grad()
     def get_action(self, obs:np.ndarray):
         obs = torch.from_numpy(obs).float().to(self.device)
-        actor_step:Union[StochasticContinuousPolicyStep, DiscretePolicyStep]  = self.actor(obs)
+        init_noise = torch.randn(self.env_num, self.action_dim).to(self.device)
+        fpo_step:FPOStep = FPO.sample_actions_with_cmf_info(self.actor, obs, init_noise, self.flow_steps, False, self.sample_per_action)
+        
         value_step:ValueStep = self.critic(obs)
         
-        action = actor_step.action
-        log_prob = actor_step.log_prob
+        action = fpo_step.action
+        eps = fpo_step.eps
+        time_step = fpo_step.time_step
+        init_cmf_loss = fpo_step.init_cmf_loss
         value = value_step.value
         
-        return action, log_prob, value
+        return action, eps, time_step, init_cmf_loss, value
     
     def rollout(self):
         obs = self.obs
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
-            action, log_prob, value = self.get_action(obs)
+            action, eps, time_step, init_cmf_loss, value = self.get_action(obs)
             next_obs, reward, terminate, timeout, info = self.envs.step(action.cpu().numpy())
             record = {
                 "observations": obs,
                 "actions": action,
-                "log_probs": log_prob,
+                "eps": eps,
+                "time_step": time_step,
+                "init_cmf_loss": init_cmf_loss,
                 "rewards": reward,
                 "values": value,
                 "terminated": terminate
@@ -109,15 +115,15 @@ class Trainer:
             
             if "episode" in info and "_episode" in info:
                 finished = info["_episode"]
+                episode_info = {}
                 if np.any(finished):
-                    episode_info = {}
                     episode_info["episode/mean_rewards"] = np.mean(info["episode"]["r"][finished])
                     episode_info["episode/mean_length"] = np.mean(info["episode"]["l"][finished])
-                    
+                
                     WandbLogger.log_metrics(episode_info, self.global_step)
                 
         self.obs = obs
-        _, _, value = self.get_action(obs)
+        _, _, _, _, value = self.get_action(obs)
         returns, advantages = compute_gae(
             self.replay_buffer.data["rewards"],
             self.replay_buffer.data["values"],
@@ -133,50 +139,54 @@ class Trainer:
     def update(self, num_iteration:int, batch_size:int):
         policy_loss_buffer = []
         value_loss_buffer = []
-        entropy_buffer = []
+        cmf_loss_buffer = []
         kl_divergence_buffer = []
         
         for _ in range(num_iteration):
             for batch in self.replay_buffer.sample_batchs(self.batch_keys, batch_size):
                 obs_batch = batch["observations"].to(self.device)
                 action_batch = batch["actions"].to(self.device)
-                log_prob_batch = batch["log_probs"].to(self.device)
+                eps_batch = batch["eps"].to(self.device)
+                time_step_batch = batch["time_step"].to(self.device)
+                init_cmf_loss_batch = batch["init_cmf_loss"].to(self.device)
                 value_batch = batch["values"].to(self.device)
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
+                policy_loss_dict = FPO.compute_policy_loss(self.actor, obs_batch, action_batch,
+                                                           eps_batch, time_step_batch, init_cmf_loss_batch,
+                                                           advantage_batch, self.clip_ratio, average_losses_before_exp=True)
 
                 policy_loss = policy_loss_dict["loss"]
-                entropy = policy_loss_dict["entropy"]
+                cmf_loss = policy_loss_dict["cmf_loss"]
                 kl_divergence = policy_loss_dict["kl_divergence"]
 
-                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
+                value_loss_dict = FPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
                 
                 value_loss = value_loss_dict["loss"]
 
-                loss = policy_loss + value_loss * self.value_loss_weight - entropy * self.entropy_weight
+                loss = policy_loss + value_loss * self.value_loss_weight
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                #torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                #torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 
                 policy_loss_buffer.append(policy_loss.item())
                 value_loss_buffer.append(value_loss.item())
-                entropy_buffer.append(entropy.item())
+                cmf_loss_buffer.append(cmf_loss.item())
                 kl_divergence_buffer.append(kl_divergence.item())
                 
         avg_policy_loss = np.mean(policy_loss_buffer)
         avg_value_loss = np.mean(value_loss_buffer)
-        avg_entropy = np.mean(entropy_buffer)
+        avg_cmf_loss = np.mean(cmf_loss_buffer)
         avg_kl_divergence = np.mean(kl_divergence_buffer)
         
         train_info = {
             "update/avg_policy_loss": avg_policy_loss,
             "update/avg_value_loss": avg_value_loss,
-            "update/avg_entropy": avg_entropy,
+            "update/avg_cmf_loss": avg_cmf_loss,
             "update/avg_kl_divergence": avg_kl_divergence
         }
 
