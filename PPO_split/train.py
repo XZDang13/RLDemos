@@ -103,8 +103,8 @@ class Trainer:
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
-            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
-            
+            next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
+            done = terminate | timeout
             record = {
                 "observations": obs,
                 "actions": action,

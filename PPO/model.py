@@ -4,15 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead, CategoricalHead
+from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead, CategoricalHead, NormPosition
 from RLAlg.nn.steps import ValueStep, StochasticContinuousPolicyStep, DiscretePolicyStep
 
 class ContinuousActor(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None, norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
         #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         #if max action is setted, normal distribution will be scaled tanh transformed.
         #if state_dependent_std is True, log std will be learned from obs
@@ -26,11 +26,11 @@ class ContinuousActor(nn.Module):
         return step
     
 class DiscreteActor(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
         #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         self.head = CategoricalHead(feature_dim, action_dim)
 
@@ -42,11 +42,11 @@ class DiscreteActor(nn.Module):
         return step
     
 class Critic(nn.Module):
-    def __init__(self, in_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
         #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         self.head = CriticHead(feature_dim)
 

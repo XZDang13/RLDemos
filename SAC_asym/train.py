@@ -105,8 +105,8 @@ class Trainer:
             self.global_step += self.env_num
             
             action = self.get_action(obs, random)
-            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
-            
+            next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
+            done = terminate | timeout
             record = {
                 "observations": obs,
                 "next_observations": next_obs,

@@ -11,6 +11,7 @@ import numpy as np
 from RLAlg.alg.sac import SAC
 from RLAlg.buffer.replay_buffer import ReplayBuffer
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
+from RLAlg.nn.layers import NormPosition
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger, MetricsTracker
 
@@ -42,9 +43,9 @@ class Trainer:
         elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
             action_dim = np.prod(self.envs.single_action_space.shape)
 
-        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
+        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action, norm_position=NormPosition.PRE).to(self.device)
+        self.critic = Critic(obs_dim, action_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
+        self.critic_target = Critic(obs_dim, action_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
         
         self.critic_target.load_state_dict(self.critic.state_dict())
 
@@ -97,8 +98,8 @@ class Trainer:
             self.global_step += self.env_num
             
             action = self.get_action(obs, random)
-            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
-            
+            next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
+            done = terminate | timeout
             record = {
                 "observations": obs,
                 "next_observations": next_obs,

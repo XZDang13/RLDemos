@@ -10,6 +10,7 @@ import numpy as np
 
 from RLAlg.alg.ppo import PPO
 from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
+from RLAlg.nn.layers import NormPosition
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger, MetricsTracker
@@ -42,13 +43,13 @@ class Trainer:
         obs_dim = np.prod(obs_space)
         if isinstance(self.envs.single_action_space, gymnasium.spaces.Discrete):
             action_dim = self.envs.single_action_space.n
-            self.actor = DiscreteActor(obs_dim, action_dim, [128, 128]).to(self.device)
+            self.actor = DiscreteActor(obs_dim, action_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
         elif isinstance(self.envs.single_action_space, gymnasium.spaces.Box):
             self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
             action_dim = np.prod(self.envs.single_action_space.shape)
-            self.actor = ContinuousActor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
+            self.actor = ContinuousActor(obs_dim, action_dim, [128, 128], self.max_action, norm_position=NormPosition.PRE).to(self.device)
 
-        self.critic = Critic(obs_dim, [128, 128]).to(self.device)
+        self.critic = Critic(obs_dim, [128, 128], norm_position=NormPosition.PRE).to(self.device)
         
         self.optimizer = optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
@@ -98,8 +99,8 @@ class Trainer:
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
-            next_obs, reward, done, timeout, info = self.envs.step(action.numpy())
-            
+            next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
+            done = terminate | timeout
             record = {
                 "observations": obs,
                 "actions": action,

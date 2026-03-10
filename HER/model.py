@@ -18,7 +18,11 @@ class Actor(nn.Module):
         #if state_dependent_std is True, log std will be learned from obs
         self.head = DeterministicHead(feature_dim, action_dim, max_action=max_action)
 
-    def forward(self, x:torch.Tensor) -> DeterministicContinuousPolicyStep:
+    def forward(self, x:dict[str:torch.Tensor]) -> DeterministicContinuousPolicyStep:
+        obs = x["observation"]
+        goal = x["desired_goal"]
+        x = torch.cat([obs, goal], dim=1)
+        
         x = self.layers(x)
 
         step:DeterministicContinuousPolicyStep = self.head(x)
@@ -34,8 +38,10 @@ class Critic(nn.Module):
 
         self.head = CriticHead(feature_dim)
 
-    def forward(self, x:torch.Tensor, action:torch.Tensor) -> ValueStep:
-        x = torch.cat([x, action], dim=1)
+    def forward(self, x:dict[str:torch.Tensor], action:torch.Tensor) -> ValueStep:
+        obs = x["observation"]
+        goal = x["desired_goal"]
+        x = torch.cat([obs, goal, action], dim=1)
         
         x = self.layers(x)
 

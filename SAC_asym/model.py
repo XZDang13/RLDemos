@@ -4,14 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead
+from RLAlg.nn.layers import make_mlp_layers, GaussianHead, CriticHead, NormPosition
 from RLAlg.nn.steps import ValueStep, StochasticContinuousPolicyStep
 
 class Encoder(nn.Module):
-    def __init__(self, in_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
         
-        self.layers, self.feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, self.feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
         
     def forward(self, x:torch.Tensor) -> torch.Tensor:
         x = self.layers(x)
@@ -19,11 +19,11 @@ class Encoder(nn.Module):
         return x
 
 class Actor(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None, norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
         #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         #if max action is setted, normal distribution will be scaled tanh transformed.
         #if state_dependent_std is True, log std will be learned from obs
@@ -37,11 +37,11 @@ class Actor(nn.Module):
         return step
     
 class QNet(nn.Module):
-    def __init__(self, in_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
         #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         self.head = CriticHead(feature_dim)
 
@@ -53,11 +53,11 @@ class QNet(nn.Module):
         return step
     
 class Critic(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
         
-        self.critic_1 = QNet(in_dim+action_dim, hidden_dims)
-        self.critic_2 = QNet(in_dim+action_dim, hidden_dims)
+        self.critic_1 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
+        self.critic_2 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
 
     def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[ValueStep, ValueStep]:
         x = torch.cat([x, action], dim=1)
