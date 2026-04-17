@@ -41,9 +41,9 @@ class Trainer:
         self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
         action_dim = np.prod(self.envs.single_action_space.shape)
         self.action_dim = action_dim
-        self.actor = Actor(obs_dim, action_dim, 32, [128, 128], velocity_scale=0.25, norm_position=NormPosition.POST).to(self.device)
+        self.actor = Actor(obs_dim, action_dim, 32, [128, 128, 128, 128], velocity_scale=0.25, norm_position=NormPosition.POST).to(self.device)
 
-        self.critic = Critic(obs_dim, [128, 128], norm_position=NormPosition.POST).to(self.device)
+        self.critic = Critic(obs_dim, [128, 128, 128, 128], norm_position=NormPosition.POST).to(self.device)
         
         self.optimizer = optim.Adam(
             list(self.actor.parameters()) + list(self.critic.parameters()), lr=3e-4
@@ -93,6 +93,7 @@ class Trainer:
         return action, eps, time_step, init_cmf_loss, value
     
     def rollout(self):
+        self.replay_buffer.reset()
         obs = self.obs
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
@@ -124,17 +125,23 @@ class Trainer:
                 
         self.obs = obs
         _, _, _, _, value = self.get_action(obs)
+        buffer_steps = self.replay_buffer.current_size
         returns, advantages = compute_gae(
-            self.replay_buffer.data["rewards"],
-            self.replay_buffer.data["values"],
-            self.replay_buffer.data["terminated"],
+            self.replay_buffer.data["rewards"][:buffer_steps],
+            self.replay_buffer.data["values"][:buffer_steps],
+            self.replay_buffer.data["terminated"][:buffer_steps],
             value,
             self.gamma,
             self.lambda_
             )
-        
-        self.replay_buffer.add_storage("returns", returns)
-        self.replay_buffer.add_storage("advantages", advantages)
+
+        returns_full = torch.zeros_like(self.replay_buffer.data["rewards"])
+        advantages_full = torch.zeros_like(self.replay_buffer.data["rewards"])
+        returns_full[:buffer_steps] = returns
+        advantages_full[:buffer_steps] = advantages
+
+        self.replay_buffer.add_storage("returns", returns_full)
+        self.replay_buffer.add_storage("advantages", advantages_full)
         
     def update(self, num_iteration:int, batch_size:int):
         policy_loss_buffer = []
@@ -161,7 +168,7 @@ class Trainer:
                 cmf_loss = policy_loss_dict["cmf_loss"]
                 kl_divergence = policy_loss_dict["kl_divergence"]
 
-                value_loss_dict = FPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
+                value_loss_dict = FPO.compute_value_loss(self.critic, obs_batch, return_batch)
                 
                 value_loss = value_loss_dict["loss"]
 
@@ -169,8 +176,8 @@ class Trainer:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                #torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                #torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 
                 policy_loss_buffer.append(policy_loss.item())
@@ -193,15 +200,34 @@ class Trainer:
         WandbLogger.log_metrics(train_info, self.global_step)
             
                 
-    def train(self, num_epoch:int, num_iteration:int, batch_size:int):
+    def train(self, total_frames:int, num_iteration:int, batch_size:int):
+        if total_frames <= 0:
+            raise ValueError(f"total_frames must be positive, got {total_frames}.")
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
+        start_step = self.global_step
+        target_step = start_step + total_frames
+        frames_per_rollout = self.env_num * self.rollout_steps
+        num_rollouts = max(1, (total_frames + frames_per_rollout - 1) // frames_per_rollout)
 
-        for _ in trange(num_epoch):
-            self.rollout()
+        for _ in trange(num_rollouts):
+            remaining_frames = target_step - self.global_step
+            if remaining_frames <= 0:
+                break
+
+            rollout_steps = min(
+                self.rollout_steps,
+                max(1, (remaining_frames + self.env_num - 1) // self.env_num),
+            )
+            original_rollout_steps = self.rollout_steps
+            self.rollout_steps = rollout_steps
+            try:
+                self.rollout()
+            finally:
+                self.rollout_steps = original_rollout_steps
             self.update(num_iteration, batch_size)
         
         
 if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 50, seed=100)
     
-    trainer.train(num_epoch=5000, num_iteration=10, batch_size=500)
+    trainer.train(total_frames=2_500_000, num_iteration=10, batch_size=500)

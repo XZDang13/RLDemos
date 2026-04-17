@@ -29,7 +29,7 @@ class Trainer:
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        self.rollout_steps = self.max_steps
+        self.rollout_steps = 50
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -37,7 +37,7 @@ class Trainer:
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        self.rollout_steps = self.max_steps
+        self.rollout_steps = 50
 
         obs_space = self.envs.single_observation_space.shape
         action_space = self.envs.single_action_space.shape
@@ -66,7 +66,7 @@ class Trainer:
             lr=1e-5, betas=(0.5, 0.999)
         )
         
-        self.replay_buffer = ReplayBuffer(env_num, self.max_steps, device=self.device)
+        self.replay_buffer = ReplayBuffer(env_num, self.rollout_steps, device=self.device)
         self.replay_buffer.create_storage_space("observations", obs_space, torch.float32)
         self.replay_buffer.create_storage_space("actions", action_space, torch.float32)
         self.replay_buffer.create_storage_space("log_probs", (), torch.float32)
@@ -114,6 +114,7 @@ class Trainer:
     
     
     def rollout(self):
+        self.replay_buffer.reset()
         obs = self.obs
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
@@ -143,17 +144,23 @@ class Trainer:
                 
         self.obs = obs
         _, _, value, _ = self.get_action(obs)
+        buffer_steps = self.replay_buffer.current_size
         returns, advantages = compute_gae(
-            self.replay_buffer.data["rewards"],
-            self.replay_buffer.data["values"],
-            self.replay_buffer.data["dones"],
+            self.replay_buffer.data["rewards"][:buffer_steps],
+            self.replay_buffer.data["values"][:buffer_steps],
+            self.replay_buffer.data["dones"][:buffer_steps],
             value,
             self.gamma,
             self.lambda_
             )
-        
-        self.replay_buffer.add_storage("returns", returns)
-        self.replay_buffer.add_storage("advantages", advantages)
+
+        returns_full = torch.zeros_like(self.replay_buffer.data["rewards"])
+        advantages_full = torch.zeros_like(self.replay_buffer.data["rewards"])
+        returns_full[:buffer_steps] = returns
+        advantages_full[:buffer_steps] = advantages
+
+        self.replay_buffer.add_storage("returns", returns_full)
+        self.replay_buffer.add_storage("advantages", advantages_full)
         
     def update(self, num_iteration:int, batch_size:int):
         policy_loss_buffer = []
@@ -230,14 +237,33 @@ class Trainer:
         WandbLogger.log_metrics(train_info, self.global_step)
             
                 
-    def train(self, num_epoch:int, num_iteration:int, batch_size:int):
+    def train(self, total_frames:int, num_iteration:int, batch_size:int):
+        if total_frames <= 0:
+            raise ValueError(f"total_frames must be positive, got {total_frames}.")
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
+        start_step = self.global_step
+        target_step = start_step + total_frames
+        frames_per_rollout = self.env_num * self.rollout_steps
+        num_rollouts = max(1, (total_frames + frames_per_rollout - 1) // frames_per_rollout)
 
-        for _ in trange(num_epoch):
-            self.rollout()
+        for _ in trange(num_rollouts):
+            remaining_frames = target_step - self.global_step
+            if remaining_frames <= 0:
+                break
+
+            rollout_steps = min(
+                self.rollout_steps,
+                max(1, (remaining_frames + self.env_num - 1) // self.env_num),
+            )
+            original_rollout_steps = self.rollout_steps
+            self.rollout_steps = rollout_steps
+            try:
+                self.rollout()
+            finally:
+                self.rollout_steps = original_rollout_steps
             self.update(num_iteration, batch_size)
         
 if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 20)
     
-    trainer.train(num_epoch=100, num_iteration=10, batch_size=500)
+    trainer.train(total_frames=100_000, num_iteration=10, batch_size=500)

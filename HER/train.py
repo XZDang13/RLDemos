@@ -84,7 +84,7 @@ class Trainer:
             desired_goal_key="desired_goal",
             achieved_goal_key="achieved_goal",
             reward_key="rewards",
-            done_key="dones",
+            terminal_key="dones",
             replay_strategy="future",
             replay_k=4,          # future_p = 1 - 1/(1 + k)
             env=self.envs
@@ -179,14 +179,14 @@ class Trainer:
         q_target_buffer = []
         
         for _ in range(num_iteration):
-            batch = self.replay_buffer.sample_batch(
+            batch = self.replay_buffer.sample_her_batch(
                 self.batch_keys,
                 batch_size,
                 future_steps=4,
                 episode_end_key="dones",
                 her_strategies=[self.her.replay_strategy],
             )
-            #batch = self.her.process_batch(batch)
+            batch = self.her.process_batch(batch)
 
             obs_batch = {
                 "observation": batch["observations"].to(self.device),
@@ -243,13 +243,33 @@ class Trainer:
 
         WandbLogger.log_metrics(train_info, self.global_step)
                 
-    def train(self, num_epoch:int, num_iteration:int, batch_size:int):
+    def train(self, total_frames:int, num_iteration:int, batch_size:int):
+        if total_frames <= 0:
+            raise ValueError(f"total_frames must be positive, got {total_frames}.")
         self.obs_dict, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
-        random = True
-        for i in trange(num_epoch):
-            if i > (num_epoch // 10):
-                random = False
-            self.rollout(random)
+        start_step = self.global_step
+        target_step = start_step + total_frames
+        frames_per_rollout = self.env_num * self.rollout_steps
+        num_rollouts = max(1, (total_frames + frames_per_rollout - 1) // frames_per_rollout)
+        warmup_frames = total_frames // 10
+
+        for _ in trange(num_rollouts):
+            remaining_frames = target_step - self.global_step
+            if remaining_frames <= 0:
+                break
+
+            collected_frames = self.global_step - start_step
+            random = collected_frames <= warmup_frames
+            rollout_steps = min(
+                self.rollout_steps,
+                max(1, (remaining_frames + self.env_num - 1) // self.env_num),
+            )
+            original_rollout_steps = self.rollout_steps
+            self.rollout_steps = rollout_steps
+            try:
+                self.rollout(random)
+            finally:
+                self.rollout_steps = original_rollout_steps
             self.update(num_iteration, batch_size)
         
         self.envs.close()
@@ -257,4 +277,4 @@ class Trainer:
 if __name__ == "__main__":
     trainer = Trainer("FetchReachDense-v4", 20, seed=0)
     
-    trainer.train(num_epoch=100, num_iteration=50, batch_size=500)
+    trainer.train(total_frames=100_000, num_iteration=20, batch_size=500)

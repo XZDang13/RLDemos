@@ -17,7 +17,7 @@ from RLAlg.logger import WandbLogger, MetricsTracker
 from model import Actor, Critic, Encoder
 
 class Trainer:
-    def __init__(self, env_name:str, env_num:int, seed:int=0):
+    def __init__(self, env_name:str, env_num:int, seed:int=0, n_step:int=1):
         self.seed = seed
         set_seed_everywhere(self.seed)
 
@@ -29,7 +29,7 @@ class Trainer:
         self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        self.rollout_steps = self.max_steps
+        self.rollout_steps = 50
         self.max_buffer_steps = 100000
 
         self.max_action = torch.from_numpy(self.envs.single_action_space.high).float().to(self.device)
@@ -71,6 +71,16 @@ class Trainer:
         self.batch_keys = ["observations", "next_observations", "actions", "rewards", "dones"]
         
         self.gamma = 0.99
+        if n_step <= 0:
+            raise ValueError(f"n_step must be positive, got {n_step}.")
+        self.n_step = n_step
+        self.sample_batch_kwargs = {
+            "n_step": self.n_step,
+            "gamma": self.gamma,
+            "reward_key": "rewards",
+            "terminal_key": "dones",
+            "bootstrap_keys": ["next_observations"],
+        }
         self.alpha = 0.2
         self.regularization_weight = 0.0
         self.tau = 0.005
@@ -137,12 +147,17 @@ class Trainer:
         q_target_buffer = []
         
         for _ in range(num_iteration):
-            batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
+            batch = self.replay_buffer.sample_n_step_batch(self.batch_keys, batch_size, **self.sample_batch_kwargs)
             obs_batch = batch["observations"].to(self.device)
             next_obs_batch = batch["next_observations"].to(self.device)
             action_batch = batch["actions"].to(self.device)
             reward_batch = batch["rewards"].to(self.device)
             done_batch = batch["dones"].to(self.device)
+            discount_batch = batch.get("bootstrap_discount")
+            if discount_batch is None:
+                discount_batch = batch.get("n_step_discount")
+            if discount_batch is not None:
+                discount_batch = discount_batch.to(self.device)
             
             self.critic_optimizer.zero_grad(set_to_none=True)
             critic_feat_batch = self.critic_encoder(obs_batch)
@@ -161,7 +176,8 @@ class Trainer:
                 next_critic_feat_batch,
                 done_batch,
                 self.alpha,
-                self.gamma
+                self.gamma,
+                discount=discount_batch,
             )
             
             critic_loss = critic_loss_dict["loss"]
@@ -222,18 +238,38 @@ class Trainer:
 
         WandbLogger.log_metrics(train_info, self.global_step)
                 
-    def train(self, num_epoch:int, num_iteration:int, batch_size:int):
+    def train(self, total_frames:int, num_iteration:int, batch_size:int):
+        if total_frames <= 0:
+            raise ValueError(f"total_frames must be positive, got {total_frames}.")
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
-        random = True
-        for i in trange(num_epoch):
-            if i > (num_epoch // 5):
-                random = False
-            self.rollout(random)
+        start_step = self.global_step
+        target_step = start_step + total_frames
+        frames_per_rollout = self.env_num * self.rollout_steps
+        num_rollouts = max(1, (total_frames + frames_per_rollout - 1) // frames_per_rollout)
+        warmup_frames = total_frames // 5
+
+        for _ in trange(num_rollouts):
+            remaining_frames = target_step - self.global_step
+            if remaining_frames <= 0:
+                break
+
+            collected_frames = self.global_step - start_step
+            random = collected_frames <= warmup_frames
+            rollout_steps = min(
+                self.rollout_steps,
+                max(1, (remaining_frames + self.env_num - 1) // self.env_num),
+            )
+            original_rollout_steps = self.rollout_steps
+            self.rollout_steps = rollout_steps
+            try:
+                self.rollout(random)
+            finally:
+                self.rollout_steps = original_rollout_steps
             self.update(num_iteration, batch_size)
         
         
 if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 20, seed=100)
     
-    trainer.train(num_epoch=100, num_iteration=250, batch_size=500)
+    trainer.train(total_frames=100_000, num_iteration=12, batch_size=500)
     
