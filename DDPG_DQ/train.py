@@ -60,9 +60,11 @@ class Trainer:
         self.replay_buffer.create_storage_space("next_observations", obs_space, torch.float32)
         self.replay_buffer.create_storage_space("actions", action_space, torch.float32)
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
-        self.replay_buffer.create_storage_space("dones", (), torch.float32)
+        self.replay_buffer.create_storage_space("terminated", (), torch.float32)
+        self.replay_buffer.create_storage_space("truncated", (), torch.float32)
+        self.replay_buffer.create_storage_space("episode_end", (), torch.float32)
 
-        self.batch_keys = ["observations", "next_observations", "actions", "rewards", "dones"]
+        self.batch_keys = ["observations", "next_observations", "actions", "rewards", "terminated"]
         
         self.gamma = 0.99
         if n_step <= 0:
@@ -72,7 +74,7 @@ class Trainer:
             "n_step": self.n_step,
             "gamma": self.gamma,
             "reward_key": "rewards",
-            "terminal_key": "dones",
+            "terminal_key": "terminated",
             "bootstrap_keys": ["next_observations"],
         }
         self.alpha = 0.2
@@ -110,13 +112,17 @@ class Trainer:
             
             action = self.get_action(obs, random)
             next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
-            done = terminate | timeout
+            terminated = terminate.astype(np.float32)
+            truncated = timeout.astype(np.float32)
+            episode_end = np.logical_or(terminate, timeout).astype(np.float32)
             record = {
                 "observations": obs,
                 "next_observations": next_obs,
                 "actions": action,
                 "rewards": reward,
-                "dones": done
+                "terminated": terminated,
+                "truncated": truncated,
+                "episode_end": episode_end,
             }
             
             self.replay_buffer.add_records(record)
@@ -146,7 +152,7 @@ class Trainer:
             next_obs_batch = batch["next_observations"].to(self.device)
             action_batch = batch["actions"].to(self.device)
             reward_batch = batch["rewards"].to(self.device)
-            done_batch = batch["dones"].to(self.device)
+            terminated_batch = batch["terminated"].to(self.device)
             discount_batch = batch.get("bootstrap_discount")
             if discount_batch is None:
                 discount_batch = batch.get("n_step_discount")
@@ -162,7 +168,7 @@ class Trainer:
                 action_batch,
                 reward_batch,
                 next_obs_batch,
-                done_batch,
+                terminated_batch,
                 std=self.std,
                 gamma=self.gamma,
                 discount=discount_batch,

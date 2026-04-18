@@ -2,10 +2,9 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, GaussianHead, DistributeCriticHead, NormPosition
-from RLAlg.nn.steps import DistributionStep, StochasticContinuousPolicyStep
+from RLAlg.nn.layers import ContinuousDistributeCriticHead, GaussianHead, NormPosition, make_mlp_layers
+from RLAlg.nn.steps import ContinuousDistributionStep, StochasticContinuousPolicyStep
 
 class Actor(nn.Module):
     def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None, norm_position:NormPosition=NormPosition.POST):
@@ -32,12 +31,12 @@ class QNet(nn.Module):
         #if norm is set true, the model will adapt layer norm
         self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
-        self.head = DistributeCriticHead(feature_dim)
+        self.head = ContinuousDistributeCriticHead(feature_dim)
 
-    def forward(self, x:torch.Tensor) -> DistributionStep:
+    def forward(self, x:torch.Tensor) -> ContinuousDistributionStep:
         x = self.layers(x)
 
-        step:DistributionStep = self.head(x)
+        step:ContinuousDistributionStep = self.head(x)
 
         return step
     
@@ -48,10 +47,10 @@ class Critic(nn.Module):
         self.critic_1 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
         self.critic_2 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
 
-    def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[DistributionStep, DistributionStep]:
+    def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[ContinuousDistributionStep, ContinuousDistributionStep]:
         x = torch.cat([x, action], dim=1)
 
-        step_1:DistributionStep = self.critic_1(x)
-        step_2:DistributionStep = self.critic_2(x)
+        step_1:ContinuousDistributionStep = self.critic_1(x)
+        step_2:ContinuousDistributionStep = self.critic_2(x)
 
         return step_1, step_2

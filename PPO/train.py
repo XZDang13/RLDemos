@@ -56,6 +56,8 @@ class Trainer:
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
         self.replay_buffer.create_storage_space("values", (), torch.float32)
         self.replay_buffer.create_storage_space("terminated", (), torch.float32)
+        self.replay_buffer.create_storage_space("truncated", (), torch.float32)
+        self.replay_buffer.create_storage_space("episode_end", (), torch.float32)
         
         self.batch_keys = ["observations", "actions", "log_probs", "rewards", "values", "returns", "advantages"]
         
@@ -95,13 +97,18 @@ class Trainer:
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
             next_obs, reward, terminate, timeout, info = self.envs.step(action.cpu().numpy())
+            terminated = terminate.astype(np.float32)
+            truncated = timeout.astype(np.float32)
+            episode_end = np.logical_or(terminate, timeout).astype(np.float32)
             record = {
                 "observations": obs,
                 "actions": action,
                 "log_probs": log_prob,
                 "rewards": reward,
                 "values": value,
-                "terminated": terminate
+                "terminated": terminated,
+                "truncated": truncated,
+                "episode_end": episode_end,
             }
             
             self.replay_buffer.add_records(record)
@@ -118,13 +125,15 @@ class Trainer:
                     WandbLogger.log_metrics(episode_info, self.global_step)
                 
         self.obs = obs
-        _, _, value = self.get_action(obs)
+        # SyncVectorEnv returns the terminal observation as next_obs on episode end,
+        # so truncation can still bootstrap from the correct final state value here.
+        _, _, bootstrap_value = self.get_action(obs)
         buffer_steps = self.replay_buffer.current_size
         returns, advantages = compute_gae(
             self.replay_buffer.data["rewards"][:buffer_steps],
             self.replay_buffer.data["values"][:buffer_steps],
             self.replay_buffer.data["terminated"][:buffer_steps],
-            value,
+            bootstrap_value,
             self.gamma,
             self.lambda_
             )
