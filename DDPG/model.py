@@ -2,20 +2,18 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from RLAlg.nn.layers import make_mlp_layers, DeterministicHead, CriticHead
+from RLAlg.nn.layers import NormPosition, make_mlp_layers, DeterministicHead, CriticHead
 from RLAlg.nn.steps import ValueStep, DeterministicContinuousPolicyStep
 
 class Actor(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[int]=None):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[float | torch.Tensor]=None):
         super().__init__()
 
-        #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        # Apply layer normalization after each linear layer.
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=NormPosition.POST)
 
-        #if max action is setted, normal distribution will be scaled tanh transformed.
-        #if state_dependent_std is True, log std will be learned from obs
+        # Bound actions with a scaled tanh transform when max_action is supplied.
         self.head = DeterministicHead(feature_dim, action_dim, max_action=max_action)
 
     def forward(self, x:torch.Tensor) -> DeterministicContinuousPolicyStep:
@@ -29,13 +27,13 @@ class Critic(nn.Module):
     def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
         super().__init__()
 
-        #if norm is set true, the model will adapt layer norm
-        self.layers, feature_dim = make_mlp_layers(in_dim+action_dim, hidden_dims, activate_function=nn.SiLU(), norm=True)
+        # Apply layer normalization after each linear layer.
+        self.layers, feature_dim = make_mlp_layers(in_dim+action_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=NormPosition.POST)
 
         self.head = CriticHead(feature_dim)
 
     def forward(self, x:torch.Tensor, action:torch.Tensor) -> ValueStep:
-        x = torch.cat([x, action], dim=1)
+        x = torch.cat([x, action], dim=-1)
         
         x = self.layers(x)
 

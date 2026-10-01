@@ -11,3 +11,5 @@ __pycache__/
 
 .vscode/
 wandb/
+.pytest_cache/
+data/
