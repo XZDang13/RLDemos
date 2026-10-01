@@ -7,11 +7,11 @@ from RLAlg.nn.layers import NormPosition, make_mlp_layers, DeterministicHead, Cr
 from RLAlg.nn.steps import ValueStep, DeterministicContinuousPolicyStep
 
 class Actor(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[float | torch.Tensor]=None):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], max_action:Optional[float | torch.Tensor]=None, norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
-        # Apply layer normalization after each linear layer.
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=NormPosition.POST)
+        # Use the requested normalization placement.
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         # Bound actions with a scaled tanh transform when max_action is supplied.
         self.head = DeterministicHead(feature_dim, action_dim, max_action=max_action)
@@ -24,11 +24,11 @@ class Actor(nn.Module):
         return step
     
 class QNet(nn.Module):
-    def __init__(self, in_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
 
-        # Apply layer normalization after each linear layer.
-        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=NormPosition.POST)
+        # Use the requested normalization placement.
+        self.layers, feature_dim = make_mlp_layers(in_dim, hidden_dims, activate_function=nn.SiLU(), norm_position=norm_position)
 
         self.head = CriticHead(feature_dim)
 
@@ -40,11 +40,11 @@ class QNet(nn.Module):
         return step
     
 class Critic(nn.Module):
-    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
+    def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int], norm_position:NormPosition=NormPosition.POST):
         super().__init__()
         
-        self.critic_1 = QNet(in_dim+action_dim, hidden_dims)
-        self.critic_2 = QNet(in_dim+action_dim, hidden_dims)
+        self.critic_1 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
+        self.critic_2 = QNet(in_dim+action_dim, hidden_dims, norm_position=norm_position)
 
     def forward(self, x:torch.Tensor, action:torch.Tensor) -> tuple[ValueStep, ValueStep]:
         x = torch.cat([x, action], dim=-1)

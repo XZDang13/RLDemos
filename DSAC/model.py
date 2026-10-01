@@ -22,7 +22,7 @@ class Actor(nn.Module):
         step:StochasticContinuousPolicyStep = self.head(x)
 
         return step
-    
+
 class QNet(nn.Module):
     def __init__(self, in_dim:int, hidden_dims:list[int]):
         super().__init__()
@@ -38,11 +38,11 @@ class QNet(nn.Module):
         step:DistributionStep = self.head(x)
 
         return step
-    
+
 class Critic(nn.Module):
     def __init__(self, in_dim:int, action_dim:int, hidden_dims:list[int]):
         super().__init__()
-        
+
         self.critic_1 = QNet(in_dim+action_dim, hidden_dims)
         self.critic_2 = QNet(in_dim+action_dim, hidden_dims)
 
