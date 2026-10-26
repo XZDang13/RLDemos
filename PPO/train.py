@@ -8,7 +8,7 @@ import torch
 from tqdm import trange
 
 from RLAlg.alg.ppo import PPO
-from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
+from RLAlg.buffer import ReplayBuffer, compute_gae
 from RLAlg.utils import set_seed_everywhere
 
 if __package__:
@@ -112,8 +112,8 @@ class Trainer:
         last_values = self.critic(observations).value
         data = self.replay_buffer.data
         returns, advantages = compute_gae(
-            data["rewards"], data["values"], data["terminated"], last_values,
-            self.gamma, self.lambda_, truncated=data["truncated"],
+            rewards=data["rewards"], values=data["values"], terminated=data["terminated"],
+            last_values=last_values, gamma=self.gamma, lambda_=self.lambda_, truncated=data["truncated"],
             # Timeout rewards already bootstrap from V(final_obs). Avoid adding
             # the library's optional V(current_obs) timeout correction as well.
             bootstrap_timeouts=False,
@@ -147,13 +147,21 @@ class Trainer:
         for _ in range(num_iteration):
             for batch in self.replay_buffer.sample_batchs(self.batch_keys, batch_size):
                 policy = PPO.compute_policy_loss(
-                    self.actor, batch["log_probs"], batch["observations"], batch["actions"],
-                    batch["advantages"], self.clip_ratio,
+                    self.actor,
+                    log_probs_hat=batch["log_probs"],
+                    observations=batch["observations"],
+                    actions=batch["actions"],
+                    advantages=batch["advantages"],
+                    clip_ratio=self.clip_ratio,
                     entropy_coef=self.entropy_weight,
                     regularization_weight=self.regularization_weight,
                 )
                 value = PPO.compute_clipped_value_loss(
-                    self.critic, batch["observations"], batch["values"], batch["returns"], self.clip_ratio,
+                    self.critic,
+                    observations=batch["observations"],
+                    values_hat=batch["values"],
+                    returns=batch["returns"],
+                    clip_ratio=self.clip_ratio,
                 )
                 loss = policy["loss"] + self.value_loss_weight * value["loss"]
                 self.optimizer.zero_grad(set_to_none=True)

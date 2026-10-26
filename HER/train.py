@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Optional
 
 from tqdm import trange
@@ -11,8 +13,7 @@ import gymnasium_robotics
 import numpy as np
 
 from RLAlg.alg.ddpg import DDPG
-from RLAlg.buffer.replay_buffer import ReplayBuffer
-from RLAlg.buffer.her import HindsightExperienceReplay
+from RLAlg.buffer.her import HERReplayBuffer, env_reward_fn
 from RLAlg.nn.steps import DeterministicContinuousPolicyStep
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger
@@ -21,6 +22,9 @@ try:
     from .model import Actor, Critic
 except ImportError:
     from model import Actor, Critic
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from demo_utils import default_checkpoint_path, episode_metrics, reset_finished_envs, save_checkpoint
 
 gymnasium.register_envs(gymnasium_robotics)
 
@@ -34,10 +38,14 @@ class Trainer:
 
         self.env_name = env_name
         self.env_num = env_num
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+        # Disable gymnasium 1.x NEXT_STEP autoreset: finished envs are reset explicitly after
+        # recording the real final observation, so no terminal->reset transition is stored.
+        self.envs = gymnasium.vector.SyncVectorEnv(
+            [lambda: self.setup_env(env_name) for _ in range(env_num)],
+            autoreset_mode=gymnasium.vector.AutoresetMode.DISABLED,
+        )
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        print(self.max_steps)
         self.rollout_steps = self.max_steps
         self.max_buffer_steps = 100000
 
@@ -70,38 +78,32 @@ class Trainer:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-4)
         
-        self.replay_buffer = ReplayBuffer(env_num, self.max_buffer_steps, device=self.device)
+        # Relabels 1 - 1/(1 + replay_k) of sampled goals with goals achieved later in the same episode.
+        self.replay_buffer = HERReplayBuffer(
+            env_num, self.max_buffer_steps, device=self.device,
+            reward_fn=env_reward_fn(self.envs), strategy="future", replay_k=4,
+        )
         self.replay_buffer.create_storage_space("observations", obs_space, torch.float32)
         self.replay_buffer.create_storage_space("next_observations", obs_space, torch.float32)
-        self.replay_buffer.create_storage_space("achieved_goal", goal_space, torch.float32)
         self.replay_buffer.create_storage_space("next_achieved_goal", goal_space, torch.float32)
         self.replay_buffer.create_storage_space("desired_goal", goal_space, torch.float32)
         self.replay_buffer.create_storage_space("actions", action_space, torch.float32)
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
-        self.replay_buffer.create_storage_space("dones", (), torch.float32)
+        # "episode_end" (terminated | truncated) delimits episodes for relabeling;
+        # "terminated" alone masks the Bellman bootstrap so timeouts still bootstrap.
+        self.replay_buffer.create_storage_space("episode_end", (), torch.bool)
+        self.replay_buffer.create_storage_space("terminated", (), torch.float32)
 
-        self.her = HindsightExperienceReplay(
-            desired_goal_key="desired_goal",
-            achieved_goal_key="achieved_goal",
-            reward_key="rewards",
-            terminal_key="dones",
-            replay_strategy="future",
-            replay_k=4,          # future_p = 1 - 1/(1 + k)
-            env=self.envs
-        )
-        
         self.batch_keys = ["observations", "next_observations", "actions",
-                           "rewards", "dones", "achieved_goal", "next_achieved_goal",
-                           "desired_goal"]
+                           "rewards", "terminated", "desired_goal"]
         
         self.gamma = 0.99
-        self.alpha = 0.2
         self.regularization_weight = 0.0
         self.tau = 0.005
         self.max_grad_norm = 1.0
         
         self.global_step = 0
-        WandbLogger.init_project("RLDemos", f"DDPG-{env_name}-{seed}")
+        WandbLogger.init_project("RLDemos", f"HER-{env_name}-{seed}")
         
         
     def setup_env(self, env_name:str, mode:Optional[str]=None) -> gymnasium.wrappers.RecordEpisodeStatistics:
@@ -137,11 +139,9 @@ class Trainer:
             self.global_step += self.env_num
             obs = obs_dict["observation"]
             goal = obs_dict["desired_goal"]
-            achieved_goal = obs_dict["achieved_goal"]
             
             action = self.get_action(obs, goal, random)
             next_obs_dict, reward, terminated, truncated, info = self.envs.step(action.cpu().numpy())
-            done = np.logical_or(terminated, truncated)
             
             next_obs = next_obs_dict["observation"]
             next_achieved_goal = next_obs_dict["achieved_goal"]
@@ -149,26 +149,21 @@ class Trainer:
             record = {
                 "observations": obs,
                 "next_observations": next_obs,
-                "achieved_goal": achieved_goal,
                 "next_achieved_goal": next_achieved_goal,
                 "desired_goal": goal,
                 "actions": action,
                 "rewards": reward,
-                "dones": done
+                "episode_end": np.logical_or(terminated, truncated),
+                "terminated": terminated
             }
             
             self.replay_buffer.add_records(record)
 
-            obs_dict = next_obs_dict
+            obs_dict = reset_finished_envs(self.envs, next_obs_dict, terminated, truncated)
             
-            if "episode" in info:
-                finished = info['episode']['_r']
-                if np.any(finished):
-                    episode_info = {}
-                    episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
-                    episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
-                    
-                    WandbLogger.log_metrics(episode_info, self.global_step)
+            episode_info = episode_metrics(info)
+            if episode_info:
+                WandbLogger.log_metrics(episode_info, self.global_step)
         
         self.obs_dict = obs_dict
         
@@ -179,14 +174,7 @@ class Trainer:
         q_target_buffer = []
         
         for _ in range(num_iteration):
-            batch = self.replay_buffer.sample_her_batch(
-                self.batch_keys,
-                batch_size,
-                future_steps=4,
-                episode_end_key="dones",
-                her_strategies=[self.her.replay_strategy],
-            )
-            batch = self.her.process_batch(batch)
+            batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
 
             obs_batch = {
                 "observation": batch["observations"].to(self.device),
@@ -197,12 +185,16 @@ class Trainer:
                 "desired_goal": batch["desired_goal"].to(self.device),
             }
             action_batch = batch["actions"].to(self.device)
-            reward_batch = batch["rewards"].to(self.device).unsqueeze(-1)
-            done_batch = batch["dones"].to(self.device).unsqueeze(-1)
+            # CriticHead squeezes Q to [B]; keep rewards/masks [B] to avoid [B, B] broadcasting.
+            reward_batch = batch["rewards"].to(self.device)
+            done_batch = batch["terminated"].to(self.device)
             
             self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss_dict = DDPG.compute_critic_loss(self.actor_target, self.critic, self.critic_target,
-                                                   obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, self.gamma)
+            critic_loss_dict = DDPG.compute_critic_loss(
+                self.actor_target, self.critic, self.critic_target,
+                observations=obs_batch, actions=action_batch, rewards=reward_batch,
+                next_observations=next_obs_batch, terminated=done_batch, gamma=self.gamma,
+            )
             critic_loss = critic_loss_dict["loss"]
             q = critic_loss_dict["q"]
             q_target = critic_loss_dict["q_target"]
@@ -213,7 +205,10 @@ class Trainer:
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            policy_loss_dict = DDPG.compute_policy_loss(self.actor, self.critic, obs_batch, self.regularization_weight)
+            policy_loss_dict = DDPG.compute_policy_loss(
+                self.actor, self.critic, observations=obs_batch,
+                regularization_weight=self.regularization_weight,
+            )
             policy_loss = policy_loss_dict["loss"]
             policy_loss.backward()
             self.actor_optimizer.step()
@@ -278,3 +273,4 @@ if __name__ == "__main__":
     trainer = Trainer("FetchReachDense-v4", 20, seed=0)
     
     trainer.train(total_frames=100_000, num_iteration=20, batch_size=500)
+    save_checkpoint(trainer, default_checkpoint_path("HER", "FetchReachDense-v4", 0), algorithm="HER", env_name="FetchReachDense-v4", seed=0)

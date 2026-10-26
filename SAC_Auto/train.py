@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Optional, Union
 
 from tqdm import trange
@@ -17,8 +19,11 @@ from RLAlg.logger import WandbLogger
 
 from model import Actor, Critic
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from demo_utils import default_checkpoint_path, save_checkpoint, episode_metrics, reset_finished_envs
+
 class Trainer:
-    def __init__(self, env_name:str, env_num:int, seed:int=0, n_step:int=1):
+    def __init__(self, env_name:str, env_num:int, seed:int=0):
         self.seed = seed
         set_seed_everywhere(self.seed)
 
@@ -27,7 +32,9 @@ class Trainer:
         
         self.env_name = env_name
         self.env_num = env_num
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+        # Disable autoreset so the real terminal observation is stored; finished envs are reset explicitly.
+        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)],
+                                                   autoreset_mode=gymnasium.vector.AutoresetMode.DISABLED)
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = 50
@@ -67,16 +74,6 @@ class Trainer:
         self.batch_keys = ["observations", "next_observations", "actions", "rewards", "terminated"]
         
         self.gamma = 0.99
-        if n_step <= 0:
-            raise ValueError(f"n_step must be positive, got {n_step}.")
-        self.n_step = n_step
-        self.sample_batch_kwargs = {
-            "n_step": self.n_step,
-            "gamma": self.gamma,
-            "reward_key": "rewards",
-            "terminal_key": "terminated",
-            "bootstrap_keys": ["next_observations"],
-        }
         self.log_alpha = torch.tensor(np.log(0.2), dtype=torch.float32, device=self.device, requires_grad=True)
         self.target_entropy = -float(action_dim)
         self.regularization_weight = 0.0
@@ -131,14 +128,10 @@ class Trainer:
             
             self.replay_buffer.add_records(record)
             
-            obs = next_obs
+            obs = reset_finished_envs(self.envs, next_obs, terminate, timeout)
             
-            if "episode" in info:
-                finished = info['episode']['_r']
-                episode_info = {}
-                episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
-                episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
-                
+            episode_info = episode_metrics(info)
+            if episode_info:
                 WandbLogger.log_metrics(episode_info, self.global_step)
         
         self.obs = obs
@@ -153,17 +146,12 @@ class Trainer:
         q_target_buffer = []
         
         for _ in range(num_iteration):
-            batch = self.replay_buffer.sample_n_step_batch(self.batch_keys, batch_size, **self.sample_batch_kwargs)
+            batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
             obs_batch = batch["observations"].to(self.device)
             next_obs_batch = batch["next_observations"].to(self.device)
             action_batch = batch["actions"].to(self.device)
             reward_batch = batch["rewards"].to(self.device)
             terminated_batch = batch["terminated"].to(self.device)
-            discount_batch = batch.get("bootstrap_discount")
-            if discount_batch is None:
-                discount_batch = batch.get("n_step_discount")
-            if discount_batch is not None:
-                discount_batch = discount_batch.to(self.device)
             alpha = self.log_alpha.exp().detach()
             
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -171,26 +159,19 @@ class Trainer:
                 self.actor,
                 self.critic,
                 self.critic_target,
-                obs_batch,
-                action_batch,
-                reward_batch,
-                next_obs_batch,
-                terminated_batch,
-                alpha,
-                self.gamma,
-                discount=discount_batch,
+                observations=obs_batch,
+                actions=action_batch,
+                rewards=reward_batch,
+                next_observations=next_obs_batch,
+                terminated=terminated_batch,  # True termination only; timeouts still bootstrap.
+                alpha=alpha,
+                gamma=self.gamma,
             )
             
-            if isinstance(critic_loss_dict, dict):
-                critic_loss = critic_loss_dict["loss"]
-                q1 = critic_loss_dict.get("q1")
-                q2 = critic_loss_dict.get("q2")
-                q_target = critic_loss_dict.get("q_target")
-            else:
-                critic_loss = critic_loss_dict
-                q1 = None
-                q2 = None
-                q_target = None
+            critic_loss = critic_loss_dict["loss"]
+            q1 = critic_loss_dict["q1"]
+            q2 = critic_loss_dict["q2"]
+            q_target = critic_loss_dict["q_target"]
                 
             if not torch.isfinite(critic_loss):
                 continue
@@ -206,15 +187,12 @@ class Trainer:
             policy_loss_dict = SAC.compute_policy_loss(
                 self.actor,
                 self.critic,
-                obs_batch.detach(),
-                alpha,
-                self.regularization_weight
+                observations=obs_batch.detach(),
+                alpha=alpha,
+                regularization_weight=self.regularization_weight
             )
             
-            if isinstance(policy_loss_dict, dict):
-                policy_loss = policy_loss_dict["loss"]
-            else:
-                policy_loss = policy_loss_dict
+            policy_loss = policy_loss_dict["loss"]
                 
             policy_loss.backward()
             self.actor_optimizer.step()
@@ -225,14 +203,11 @@ class Trainer:
             self.alpha_optimizer.zero_grad(set_to_none=True)
             alpha_loss_dict = SAC.compute_alpha_loss(
                 self.actor,
-                self.log_alpha,
-                obs_batch.detach(),
-                self.target_entropy
+                log_alpha=self.log_alpha,
+                observations=obs_batch.detach(),
+                target_entropy=self.target_entropy
             )
-            if isinstance(alpha_loss_dict, dict):
-                alpha_loss = alpha_loss_dict["alpha_loss"]
-            else:
-                alpha_loss = alpha_loss_dict
+            alpha_loss = alpha_loss_dict["loss"]
                 
             if not torch.isfinite(alpha_loss):
                 continue
@@ -251,12 +226,9 @@ class Trainer:
             alpha_loss_buffer.append(alpha_loss.item())
             alpha_buffer.append(self.alpha.item())
             
-            if q1 is not None:
-                q1_buffer.append(q1.item())
-            if q2 is not None:
-                q2_buffer.append(q2.item())
-            if q_target is not None:
-                q_target_buffer.append(q_target.item())
+            q1_buffer.append(q1.item())
+            q2_buffer.append(q2.item())
+            q_target_buffer.append(q_target.item())
             
         if not policy_loss_buffer:
             return
@@ -273,12 +245,9 @@ class Trainer:
             "update/avg_alpha": avg_alpha,
         }
         
-        if q1_buffer:
-            train_info["update/avg_q1"] = np.mean(q1_buffer)
-        if q2_buffer:
-            train_info["update/avg_q2"] = np.mean(q2_buffer)
-        if q_target_buffer:
-            train_info["update/avg_q_target"] = np.mean(q_target_buffer)
+        train_info["update/avg_q1"] = np.mean(q1_buffer)
+        train_info["update/avg_q2"] = np.mean(q2_buffer)
+        train_info["update/avg_q_target"] = np.mean(q_target_buffer)
 
         WandbLogger.log_metrics(train_info, self.global_step)
                 
@@ -313,7 +282,8 @@ class Trainer:
         
         
 if __name__ == "__main__":
-    trainer = Trainer("HalfCheetah-v5", 20, seed=100, n_step=1)
+    trainer = Trainer("HalfCheetah-v5", 20, seed=100)
     
     trainer.train(total_frames=1_000_000, num_iteration=25, batch_size=500)
+    save_checkpoint(trainer, default_checkpoint_path("SAC_Auto", "HalfCheetah-v5", 100), algorithm="SAC_Auto", env_name="HalfCheetah-v5", seed=100)
     

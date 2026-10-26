@@ -135,9 +135,12 @@ class Trainer:
             done_batch = batch["dones"].to(self.device)
 
             self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_result = DSAC.compute_critic_loss(self.actor_target, self.critic, self.critic_target,
-                                                    obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, self.alpha,
-                                                    self.gamma, self.td_bound)
+            critic_result = DSAC.compute_critic_loss(
+                self.actor_target, self.critic, self.critic_target,
+                observations=obs_batch, actions=action_batch, rewards=reward_batch,
+                next_observations=next_obs_batch, terminated=done_batch, alpha=self.alpha,
+                gamma=self.gamma, td_bound=self.td_bound,
+            )
             critic_loss = critic_result["loss"]
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
@@ -147,7 +150,10 @@ class Trainer:
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            policy_result = DSAC.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.alpha, self.regularization_weight)
+            policy_result = DSAC.compute_policy_loss(
+                self.actor, self.critic, observations=obs_batch.detach(), alpha=self.alpha,
+                regularization_weight=self.regularization_weight,
+            )
             policy_loss = policy_result["loss"]
             policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)

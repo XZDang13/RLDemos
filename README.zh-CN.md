@@ -16,6 +16,7 @@
 | `DSACT` | Distributional SAC with twin critics | 在线 replay buffer，运行标准差统计 | Box |
 | `FPO` | Flow Policy Optimization | 在线 rollout，保存 CMF 采样目标 | Box |
 | `IQL` | Implicit Q-Learning | 固定离线 `.npz` 数据集 | Box |
+| `SHAC` | Short-Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 
 Box 动作空间目前要求一维、有限且关于 0 对称。观测通过 `FlattenObservation`
 展平；例子使用 MLP，不面向像素观测。各 `model.py` 展示网络，`train.py` 展示训练流程。
@@ -116,6 +117,44 @@ python -m FPO.benchmark --env Pendulum-v1 --seed 0 --epochs 120 --rollout-steps 
 重复使用 `--seed 1` 和 `--seed 2` 可检查不同随机种子的学习情况。
 数值结果及修复前的对照设置见 [FPO 实验报告](FPO/results/REPORT.md)。
 
+## SHAC 可微仿真例子
+
+SHAC 需要对仿真器反向传播，因此使用 [Rewarped](https://github.com/rewarped/rewarped)
+的 DFlex 任务，而不是 Gymnasium。Rewarped 1.3.3 锁定 `warp-lang==1.3.3`，
+这个版本仍带有它依赖的 `warp.sim` 模块，所以不能和 Isaac Lab 等需要新版 Warp
+的包共用环境。请使用独立的 CUDA 环境：
+
+```bash
+conda create -n rewarped python=3.10
+conda activate rewarped
+python -m pip install torch torchvision gym==0.23.1 rewarped
+python -m pip install -r requirements.txt
+python -m pip install -e ../RLAlg
+```
+
+默认超参数沿用官方 SHAC 的 Ant 配置：128 个环境、视界 32、`[400, 200, 100]`
+的 ELU 网络、actor/critic 学习率 `2e-3` 和 `5e-4` 并线性衰减、Adam betas
+`(0.7, 0.95)`、TD(λ=0.95) 目标、每轮 critic 迭代 16 次（4 个 minibatch）、
+`tau=0.01` 的目标 critic，以及 1.0 的梯度裁剪：
+
+```bash
+python -m SHAC.train --env Ant --epochs 2000
+python -m SHAC.train --env Ant --env-num 16 --epochs 3 --horizon 8  # 快速检查
+```
+
+`--env` 可选 `Ant`、`Hopper`、`Humanoid`、`Cartpole`、`Anymal`、`A1`。
+每个 epoch 先调用 `env.initialize_trajectory()`：保留仿真状态，但截断到之前 epoch 的计算图。
+下一状态价值由目标 critic 在 `obs_before_reset` 上计算，因此终止的 episode 不做 bootstrap，超时会做。
+观测统计量在 rollout 期间冻结，rollout 结束后再更新。梯度出现非有限值时跳过该次 actor 更新。
+`episode/mean_rewards` 是随机策略训练 episode 的未折扣回报。
+
+用默认配置、seed 0 跑 Ant（2000 epochs，8.19M 步，RTX 3090 上约 68 分钟）：
+前 200 个 epoch 的平均训练回报约 690，最后 200 个约 1500。训练几百个 epoch 后，
+大多数 episode 都能跑满 1000 步上限。
+
+`Trainer(..., env=...)` 可以接收任何接口相同的环境对象。测试用它接入一个可微的点质量环境，
+因此不装 Rewarped 也能运行。
+
 ## IQL 离线例子
 
 先采集一个随机策略数据集，再从文件训练：
@@ -142,6 +181,25 @@ python -m IQL.train --env Pendulum-v1 --dataset data/pendulum_random.npz --epoch
 | `truncated` | `[N]` | 可选的超时标记，缺省为 False |
 | `env_name` | 标量字符串 | 可选的环境 ID，用于检查数据与环境一致性 |
 
+## Checkpoint
+
+每个 `train.py` 训练结束后都会保存 checkpoint，默认路径是
+`checkpoints/<算法>-<环境>-<seed>.pt`（已加入 `.gitignore`），可以用 `--save-path`
+指定其他位置。没有命令行参数的例子（AMP、GAIL、HER、PPO_RNN、PPO_split、
+SAC_Auto、SAC_asym）固定保存到默认路径。checkpoint 包含 trainer 上所有网络、
+归一化器和优化器的 `state_dict`，以及 `log_alpha` 这类独立的可学习张量；
+DSACT 还会保存 critic 标准差的滑动平均（trainer 在 `extra_checkpoint_state` 里列出）。
+环境、replay buffer 和 logger 不保存。元数据记录算法、环境、seed 和 `global_step`。
+恢复时用相同配置构造 trainer，再把状态加载进去：
+
+```python
+from demo_utils import load_checkpoint
+from SAC.train import Trainer
+
+trainer = Trainer("Pendulum-v1", 4)
+metadata = load_checkpoint(trainer, "checkpoints/SAC-Pendulum-v1-0.pt")
+```
+
 ## 验证
 
 快速检查每个在线算法的一次采样和更新：
@@ -157,7 +215,8 @@ done
 回归测试覆盖参数更新、离散动作类型、终止/超时、真实末状态、异步部分重置、
 DDPGDoubleQ 的噪声参数、FPO 的 CMF 目标复用、观测统计冻结、奖励/超时缩放、
 价值梯度、独立评估随机数和三个随机种子的奖励学习检查，
-以及 IQL 的离线训练与数据校验：
+IQL 的离线训练与数据校验，
+以及所有维护中的 trainer 的 checkpoint 保存/加载往返和 `--save-path` 参数：
 
 ```bash
 python -m pip install pytest

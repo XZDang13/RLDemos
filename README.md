@@ -17,6 +17,7 @@ RLAlg checkout containing these interfaces are required.
 | `DSACT` | Distributional SAC with twin critics | Online replay buffer, running standard deviation statistics | Box |
 | `FPO` | Flow Policy Optimization | Online rollouts with stored CMF sampling targets | Box |
 | `IQL` | Implicit Q-Learning | Fixed offline `.npz` dataset | Box |
+| `SHAC` | Short-Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 
 Box action spaces must be one-dimensional, finite, and symmetric around zero.
 Observations are flattened with `FlattenObservation`. These examples use MLPs
@@ -142,6 +143,50 @@ Repeat with `--seed 1` and `--seed 2` to check learning across random seeds.
 See the [FPO experiment report (Chinese)](FPO/results/REPORT.md) for numerical
 results and comparison configurations.
 
+## SHAC differentiable simulation example
+
+SHAC backpropagates through the simulator, so it uses
+[Rewarped](https://github.com/rewarped/rewarped) DFlex tasks instead of
+Gymnasium. Rewarped 1.3.3 pins `warp-lang==1.3.3`, which still has the
+`warp.sim` module it needs. It cannot share an environment with Isaac Lab or
+other packages that require a newer Warp. Use a separate CUDA environment:
+
+```bash
+conda create -n rewarped python=3.10
+conda activate rewarped
+python -m pip install torch torchvision gym==0.23.1 rewarped
+python -m pip install -r requirements.txt
+python -m pip install -e ../RLAlg
+```
+
+The defaults follow the reference SHAC Ant configuration: 128 environments,
+horizon 32, `[400, 200, 100]` ELU networks, actor/critic learning rates `2e-3`
+and `5e-4` decayed linearly, Adam betas `(0.7, 0.95)`, TD(λ=0.95) targets with
+16 critic iterations over 4 minibatches, a target critic with `tau=0.01`, and
+gradient clipping at 1.0:
+
+```bash
+python -m SHAC.train --env Ant --epochs 2000
+python -m SHAC.train --env Ant --env-num 16 --epochs 3 --horizon 8  # quick check
+```
+
+`--env` accepts `Ant`, `Hopper`, `Humanoid`, `Cartpole`, `Anymal`, and `A1`.
+Each epoch starts with `env.initialize_trajectory()`, which keeps the simulator
+state but cuts the graph to earlier epochs. Next values come from the target
+critic on `obs_before_reset`, so terminated episodes do not bootstrap and
+timeouts do. Observation statistics are frozen during a rollout and updated
+afterwards. Actor updates with non-finite gradients are skipped.
+`episode/mean_rewards` reports the undiscounted return of stochastic training
+episodes.
+
+A default Ant run with seed 0 (2000 epochs, 8.19M steps, about 68 minutes on an
+RTX 3090) raised the mean training return from about 690 over the first 200
+epochs to about 1500 over the last 200. Most episodes reached the 1000-step limit
+after the first few hundred epochs.
+
+`Trainer(..., env=...)` accepts any object with the same API. The tests use this
+with a differentiable point-mass environment, so they run without Rewarped.
+
 ## IQL offline example
 
 Collect a dataset with a random policy, then train from the saved file:
@@ -170,6 +215,28 @@ You can provide your own `.npz` dataset with the following fields:
 | `truncated` | `[N]` | Optional timeout flags; defaults to False |
 | `env_name` | Scalar string | Optional environment ID for checking dataset/environment compatibility |
 
+## Checkpoints
+
+Every `train.py` saves a checkpoint after training finishes, by default to
+`checkpoints/<algorithm>-<env>-<seed>.pt` (ignored by Git). Use `--save-path`
+to choose another location. The demos without a command line (AMP, GAIL, HER,
+PPO_RNN, PPO_split, SAC_Auto, SAC_asym) always use the default path.
+A checkpoint stores the `state_dict` of every network, normalizer and
+optimizer on the trainer, plus free learnable tensors such as `log_alpha`.
+DSACT also saves its running critic standard-deviation statistics, which a
+trainer lists in `extra_checkpoint_state`. Environments, replay buffers and
+loggers are not saved. The metadata records
+the algorithm, environment, seed and `global_step`. To restore, build a trainer
+with the same options and load the state into it:
+
+```python
+from demo_utils import load_checkpoint
+from SAC.train import Trainer
+
+trainer = Trainer("Pendulum-v1", 4)
+metadata = load_checkpoint(trainer, "checkpoints/SAC-Pendulum-v1-0.pt")
+```
+
 ## Validation
 
 Quickly check one rollout and update for each online algorithm:
@@ -187,7 +254,8 @@ and timeouts, actual final observations, partial resets when environments finish
 at different times, and DDPGDoubleQ noise arguments. FPO checks cover reuse of
 CMF targets, frozen observation statistics, reward/timeout scaling, value
 gradients, evaluation randomness, and reward learning across three random seeds.
-IQL checks cover offline training and dataset validation:
+IQL checks cover offline training and dataset validation. Checkpoint tests cover
+save/load round trips for every maintained trainer and the `--save-path` option:
 
 ```bash
 python -m pip install pytest

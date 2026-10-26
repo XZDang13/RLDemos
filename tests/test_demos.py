@@ -178,6 +178,7 @@ def test_double_q_passes_std_and_gamma_independently(monkeypatch):
         trainer.rollout()
         trainer.update(1, 4)
         assert seen["std"] == 0.23 and seen["gamma"] == 0.8
+        assert {"observations", "actions", "rewards", "next_observations", "terminated"} <= seen.keys()
     finally:
         trainer.close()
 
@@ -190,7 +191,8 @@ def test_fpo_reuses_stored_cmf_samples():
         trainer.rollout()
         batch = trainer.replay_buffer.sample_batch(trainer.batch_keys, 4)
         losses = FPO.compute_cmf_loss(
-            trainer.actor, batch["observations"], batch["actions"], batch["eps"], batch["time_steps"],
+            trainer.actor, observations=batch["observations"], actions=batch["actions"],
+            eps=batch["eps"], t=batch["time_steps"],
         )
         assert torch.allclose(losses, batch["init_cmf_loss"], atol=1e-6)
     finally:

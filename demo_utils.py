@@ -1,6 +1,7 @@
-"""Shared environment, logging, and command-line helpers for the demos."""
+"""Shared environment, logging, checkpoint, and command-line helpers for the demos."""
 
 import argparse
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -84,6 +85,55 @@ class DemoLogger:
             WandbLogger.finish_project()
 
 
+CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+
+
+def default_checkpoint_path(algorithm, env_name, seed):
+    return CHECKPOINT_DIR / f"{algorithm}-{env_name}-{seed}.pt"
+
+
+def checkpoint_state(trainer):
+    # Networks, normalizers, optimizers, free learnable tensors such as log_alpha, and any
+    # attribute the trainer lists in `extra_checkpoint_state` (tensors or None, saved as is).
+    # Environments, replay buffers and loggers are not saved.
+    extra = set(getattr(trainer, "extra_checkpoint_state", ()))
+    state = {}
+    for name, value in vars(trainer).items():
+        if name in extra:
+            state[name] = value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        elif isinstance(value, (torch.nn.Module, torch.optim.Optimizer)):
+            state[name] = value.state_dict()
+        elif isinstance(value, torch.Tensor) and value.is_leaf and value.requires_grad:
+            state[name] = value.detach().cpu()
+    return state
+
+
+def save_checkpoint(trainer, path, **metadata):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if hasattr(trainer, "global_step"):
+        metadata.setdefault("global_step", trainer.global_step)
+    torch.save({"metadata": metadata, "state": checkpoint_state(trainer)}, path)
+    print(f"Saved checkpoint to {path}")
+    return path
+
+
+def load_checkpoint(trainer, path, map_location=None):
+    """Restore the state saved by ``save_checkpoint`` into a trainer built with the same options."""
+    checkpoint = torch.load(path, map_location=map_location or getattr(trainer, "device", None))
+    extra = set(getattr(trainer, "extra_checkpoint_state", ()))
+    for name, value in checkpoint["state"].items():
+        target = getattr(trainer, name)
+        if name in extra:
+            setattr(trainer, name, value.to(trainer.device) if isinstance(value, torch.Tensor) else value)
+        elif isinstance(target, torch.Tensor):
+            with torch.no_grad():
+                target.copy_(value)
+        else:
+            target.load_state_dict(value)
+    return checkpoint["metadata"]
+
+
 def run_training(trainer_type, algorithm, default_iterations=250):
     parser = argparse.ArgumentParser(description=f"Train the {algorithm} demo.")
     parser.add_argument("--env", default="HalfCheetah-v5")
@@ -95,6 +145,8 @@ def run_training(trainer_type, algorithm, default_iterations=250):
     parser.add_argument("--rollout-steps", type=int)
     parser.add_argument("--device", default=None, help="For example: cpu, cuda, cuda:0.")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
+    parser.add_argument("--save-path", default=None,
+                        help="Checkpoint path. Defaults to checkpoints/<algorithm>-<env>-<seed>.pt.")
     if algorithm in {"PPO", "FPO"}:
         parser.add_argument("--bootstrap-timeouts", action=argparse.BooleanOptionalAction, default=True)
     if algorithm == "PPO":
@@ -148,5 +200,9 @@ def run_training(trainer_type, algorithm, default_iterations=250):
     trainer = trainer_type(args.env, args.env_num, **options)
     try:
         trainer.train(args.epochs, args.iterations, args.batch_size)
+        save_checkpoint(
+            trainer, args.save_path or default_checkpoint_path(algorithm, args.env, args.seed),
+            algorithm=algorithm, env_name=args.env, seed=args.seed,
+        )
     finally:
         trainer.close()

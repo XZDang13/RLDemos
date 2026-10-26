@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Union, Optional
 
 from tqdm import trange
@@ -16,8 +18,11 @@ from RLAlg.logger import WandbLogger, MetricsTracker
 
 from model import Actor, Critic, Encoder
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from demo_utils import default_checkpoint_path, save_checkpoint, episode_metrics, reset_finished_envs
+
 class Trainer:
-    def __init__(self, env_name:str, env_num:int, seed:int=0, n_step:int=1):
+    def __init__(self, env_name:str, env_num:int, seed:int=0):
         self.seed = seed
         set_seed_everywhere(self.seed)
 
@@ -26,7 +31,9 @@ class Trainer:
         
         self.env_name = env_name
         self.env_num = env_num
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+        # Disable autoreset so the real terminal observation is stored; finished envs are reset explicitly.
+        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)],
+                                                   autoreset_mode=gymnasium.vector.AutoresetMode.DISABLED)
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = 50
@@ -71,16 +78,6 @@ class Trainer:
         self.batch_keys = ["observations", "next_observations", "actions", "rewards", "dones"]
         
         self.gamma = 0.99
-        if n_step <= 0:
-            raise ValueError(f"n_step must be positive, got {n_step}.")
-        self.n_step = n_step
-        self.sample_batch_kwargs = {
-            "n_step": self.n_step,
-            "gamma": self.gamma,
-            "reward_key": "rewards",
-            "terminal_key": "dones",
-            "bootstrap_keys": ["next_observations"],
-        }
         self.alpha = 0.2
         self.regularization_weight = 0.0
         self.tau = 0.005
@@ -115,8 +112,8 @@ class Trainer:
             self.global_step += self.env_num
             
             action = self.get_action(obs, random)
-            next_obs, reward, terminate, timeout, info = self.envs.step(action.numpy())
-            done = terminate | timeout
+            next_obs, reward, terminate, timeout, info = self.envs.step(action.cpu().numpy())
+            done = terminate  # True termination only; timeouts still bootstrap.
             record = {
                 "observations": obs,
                 "next_observations": next_obs,
@@ -127,14 +124,10 @@ class Trainer:
             
             self.replay_buffer.add_records(record)
             
-            obs = next_obs
+            obs = reset_finished_envs(self.envs, next_obs, terminate, timeout)
             
-            if "episode" in info:
-                finished = info['episode']['_r']
-                episode_info = {}
-                episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
-                episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
-                
+            episode_info = episode_metrics(info)
+            if episode_info:
                 WandbLogger.log_metrics(episode_info, self.global_step)
         
         self.obs = obs
@@ -147,17 +140,12 @@ class Trainer:
         q_target_buffer = []
         
         for _ in range(num_iteration):
-            batch = self.replay_buffer.sample_n_step_batch(self.batch_keys, batch_size, **self.sample_batch_kwargs)
+            batch = self.replay_buffer.sample_batch(self.batch_keys, batch_size)
             obs_batch = batch["observations"].to(self.device)
             next_obs_batch = batch["next_observations"].to(self.device)
             action_batch = batch["actions"].to(self.device)
             reward_batch = batch["rewards"].to(self.device)
             done_batch = batch["dones"].to(self.device)
-            discount_batch = batch.get("bootstrap_discount")
-            if discount_batch is None:
-                discount_batch = batch.get("n_step_discount")
-            if discount_batch is not None:
-                discount_batch = discount_batch.to(self.device)
             
             self.critic_optimizer.zero_grad(set_to_none=True)
             critic_feat_batch = self.critic_encoder(obs_batch)
@@ -165,19 +153,21 @@ class Trainer:
             with torch.no_grad():
                 next_actor_feat_batch = self.actor_encoder(next_obs_batch)
                 next_critic_feat_batch = self.critic_target_encoder(next_obs_batch)
-            critic_loss_dict = SAC.compute_critic_loss_asymmetric(
+            # The critic loss never evaluates the actor on the current state, so only critic features
+            # are needed there; the actor sees actor features of the next state.
+            critic_loss_dict = SAC.compute_critic_loss(
                 self.actor,
                 self.critic,
                 self.critic_target,
-                critic_feat_batch,
-                action_batch,
-                reward_batch,
-                next_actor_feat_batch,
-                next_critic_feat_batch,
-                done_batch,
-                self.alpha,
-                self.gamma,
-                discount=discount_batch,
+                observations=critic_feat_batch,
+                critic_observations=critic_feat_batch,
+                actions=action_batch,
+                rewards=reward_batch,
+                next_observations=next_actor_feat_batch,
+                next_critic_observations=next_critic_feat_batch,
+                terminated=done_batch,
+                alpha=self.alpha,
+                gamma=self.gamma,
             )
             
             critic_loss = critic_loss_dict["loss"]
@@ -200,7 +190,10 @@ class Trainer:
             actor_feat_batch = self.actor_encoder(obs_batch)
             critic_feat_batch = self.critic_encoder(obs_batch)
             
-            policy_loss_dict = SAC.compute_policy_loss_asymmetric(self.actor, self.critic, actor_feat_batch, critic_feat_batch, self.alpha, self.regularization_weight)
+            policy_loss_dict = SAC.compute_policy_loss(
+                self.actor, self.critic, observations=actor_feat_batch, critic_observations=critic_feat_batch,
+                alpha=self.alpha, regularization_weight=self.regularization_weight,
+            )
             
             policy_loss = policy_loss_dict["loss"]
             
@@ -272,4 +265,5 @@ if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 20, seed=100)
     
     trainer.train(total_frames=100_000, num_iteration=12, batch_size=500)
+    save_checkpoint(trainer, default_checkpoint_path("SAC_asym", "HalfCheetah-v5", 100), algorithm="SAC_asym", env_name="HalfCheetah-v5", seed=100)
     

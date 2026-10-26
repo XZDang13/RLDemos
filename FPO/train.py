@@ -85,7 +85,10 @@ class Trainer(PPOTrainer):
         observations = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
         noise = torch.randn((len(obs), self.max_action.numel()), device=self.device)
         step = FPO.sample_actions_with_cmf_info(
-            self.actor, observations, noise, self.flow_steps,
+            self.actor,
+            observations=observations,
+            init_noise=noise,
+            flow_steps=self.flow_steps,
             deterministic=True,
             n_samples_per_action=self.cmf_samples,
             supervise_target=self.supervise_target,
@@ -138,17 +141,28 @@ class Trainer(PPOTrainer):
         for _ in range(num_iteration):
             for batch in self.replay_buffer.sample_batchs(self.batch_keys, batch_size):
                 policy = FPO.compute_policy_loss(
-                    self.actor, batch["observations"], batch["actions"],
-                    batch["eps"], batch["time_steps"], batch["init_cmf_loss"],
-                    batch["advantages"], self.clip_ratio,
+                    self.actor,
+                    observations=batch["observations"],
+                    actions=batch["actions"],
+                    eps=batch["eps"],
+                    t=batch["time_steps"],
+                    init_cmf_loss=batch["init_cmf_loss"],
+                    advantages=batch["advantages"],
+                    clip_ratio=self.clip_ratio,
                     average_losses_before_exp=True,
                     supervise_target=self.supervise_target,
                 )
                 if self.value_clip_range is None:
-                    value = FPO.compute_value_loss(self.critic, batch["observations"], batch["returns"])
+                    value = FPO.compute_value_loss(
+                        self.critic, observations=batch["observations"], returns=batch["returns"],
+                    )
                 else:
                     value = FPO.compute_clipped_value_loss(
-                        self.critic, batch["observations"], batch["values"], batch["returns"], self.value_clip_range,
+                        self.critic,
+                        observations=batch["observations"],
+                        values_hat=batch["values"],
+                        returns=batch["returns"],
+                        clip_ratio=self.value_clip_range,
                     )
                 loss = policy["loss"] + self.value_loss_weight * value["loss"]
                 self.optimizer.zero_grad(set_to_none=True)

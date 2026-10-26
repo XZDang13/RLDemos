@@ -16,10 +16,10 @@ class Actor(nn.Module):
         # Bound actions with a scaled tanh transform when max_action is supplied.
         self.head = DeterministicHead(feature_dim, action_dim, max_action=max_action)
 
-    def forward(self, x:torch.Tensor, std:float) -> DeterministicContinuousPolicyStep:
+    def forward(self, x:torch.Tensor) -> DeterministicContinuousPolicyStep:
         x = self.layers(x)
 
-        step:DeterministicContinuousPolicyStep = self.head(x, std)
+        step:DeterministicContinuousPolicyStep = self.head(x)
 
         return step
     

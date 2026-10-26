@@ -16,7 +16,9 @@ if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from IQL.model import Actor, Critic, Value
-from demo_utils import DemoLogger, continuous_action_limit, mean_metrics, setup_env
+from demo_utils import (
+    DemoLogger, continuous_action_limit, default_checkpoint_path, mean_metrics, save_checkpoint, setup_env,
+)
 
 
 class Trainer:
@@ -100,17 +102,19 @@ class Trainer:
         for _ in range(num_iteration):
             batch = self.sample_batch(batch_size)
             value = IQL.compute_value_loss(
-                self.value, self.critic_target, batch["observations"], batch["actions"], self.expectile,
+                self.value, self.critic_target,
+                observations=batch["observations"], actions=batch["actions"], expectile=self.expectile,
             )
             self.optimize(value, self.value, self.value_optimizer)
             critic = IQL.compute_critic_loss(
-                self.value, self.critic, batch["observations"], batch["actions"],
-                batch["rewards"], batch["terminated"], batch["next_observations"], self.gamma,
+                self.value, self.critic,
+                observations=batch["observations"], actions=batch["actions"], rewards=batch["rewards"],
+                next_observations=batch["next_observations"], terminated=batch["terminated"], gamma=self.gamma,
             )
             self.optimize(critic, self.critic, self.critic_optimizer)
             policy = IQL.compute_policy_loss(
-                self.actor, self.value, self.critic_target, batch["observations"],
-                batch["actions"], self.temperature,
+                self.actor, self.value, self.critic_target,
+                observations=batch["observations"], actions=batch["actions"], temperature=self.temperature,
             )
             self.optimize(policy, self.actor, self.actor_optimizer)
             IQL.update_target_param(self.critic, self.critic_target, self.tau)
@@ -163,6 +167,8 @@ def main():
     parser.add_argument("--eval-episodes", type=int, default=0)
     parser.add_argument("--device", default=None)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--save-path", default=None,
+                        help="Checkpoint path. Defaults to checkpoints/IQL-<env>-<seed>.pt.")
     args = parser.parse_args()
     if min(args.epochs, args.iterations, args.batch_size) <= 0 or args.eval_episodes < 0:
         parser.error("Training counts must be positive and --eval-episodes must be non-negative.")
@@ -174,6 +180,10 @@ def main():
     )
     try:
         trainer.train(args.epochs, args.iterations, args.batch_size)
+        save_checkpoint(
+            trainer, args.save_path or default_checkpoint_path("IQL", args.env, args.seed),
+            algorithm="IQL", env_name=args.env, seed=args.seed,
+        )
         if args.eval_episodes:
             trainer.evaluate(args.eval_episodes)
     finally:

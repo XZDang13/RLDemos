@@ -42,7 +42,9 @@ def one_thread():
 @torch.no_grad()
 def policy_reward(trainer, noise):
     observations = torch.zeros((len(noise), 1))
-    step = FPO.sample_actions(trainer.actor, observations, noise, trainer.flow_steps)
+    step = FPO.sample_actions(
+        trainer.actor, observations=observations, init_noise=noise, flow_steps=trainer.flow_steps,
+    )
     actions = torch.tanh(step.action)
     return -((actions - 0.6) ** 2).mean().item()
 
@@ -83,13 +85,15 @@ def test_rollout_and_update_use_the_trainer_configuration(target, sampler, monke
         trainer.rollout()
         batch = trainer.replay_buffer.sample_batch(trainer.batch_keys, 8)
         losses = FPO.compute_cmf_loss(
-            trainer.actor, batch["observations"], batch["actions"], batch["eps"], batch["time_steps"],
+            trainer.actor, observations=batch["observations"], actions=batch["actions"],
+            eps=batch["eps"], t=batch["time_steps"],
             supervise_target=trainer.supervise_target,
         )
         assert torch.allclose(losses, batch["init_cmf_loss"], atol=1e-6)
         result = FPO.compute_policy_loss(
-            trainer.actor, batch["observations"], batch["actions"], batch["eps"], batch["time_steps"],
-            batch["init_cmf_loss"], batch["advantages"], trainer.clip_ratio,
+            trainer.actor, observations=batch["observations"], actions=batch["actions"],
+            eps=batch["eps"], t=batch["time_steps"], init_cmf_loss=batch["init_cmf_loss"],
+            advantages=batch["advantages"], clip_ratio=trainer.clip_ratio,
             supervise_target=trainer.supervise_target,
         )
         assert result["ratio"].item() == pytest.approx(1.0)
@@ -118,7 +122,8 @@ def test_normalization_is_frozen_until_the_next_rollout():
         assert torch.allclose(trainer.observation_normalizer.mean.float(), previous_observations.mean((0, 1)))
         batch = trainer.replay_buffer.sample_batch(trainer.batch_keys, 16)
         current = FPO.compute_cmf_loss(
-            trainer.actor, batch["observations"], batch["actions"], batch["eps"], batch["time_steps"],
+            trainer.actor, observations=batch["observations"], actions=batch["actions"],
+            eps=batch["eps"], t=batch["time_steps"],
             supervise_target=trainer.supervise_target,
         )
         assert torch.allclose(current, batch["init_cmf_loss"], atol=1e-6)

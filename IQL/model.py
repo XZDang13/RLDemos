@@ -1,3 +1,5 @@
+import math
+
 import torch.nn as nn
 
 from RLAlg.nn.layers import GaussianHead, NormPosition, make_mlp_layers
@@ -17,7 +19,7 @@ class Actor(nn.Module):
         )
         self.head = GaussianHead(
             feature_dim, action_dim, max_action=max_action,
-            state_dependent_std=True, log_std_min=-5, log_std_max=2,
+            state_dependent_std=True, std_min=math.exp(-5), std_max=math.exp(2),
         )
 
     def forward(self, obs, action=None):

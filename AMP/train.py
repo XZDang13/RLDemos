@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Union, Optional
 
 from tqdm import trange
@@ -10,13 +12,16 @@ import numpy as np
 
 from RLAlg.alg.ppo import PPO
 from RLAlg.alg.gan import GAN
-from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
+from RLAlg.buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, DiscretePolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger,MetricsTracker
 
 
 from model import ContinuousActor, DiscreteActor, Critic, Discriminator
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from demo_utils import default_checkpoint_path, save_checkpoint, episode_metrics, reset_finished_envs
 
 class Trainer:
     def __init__(self, env_name:str, env_num:int, seed:int=0):
@@ -27,15 +32,11 @@ class Trainer:
 
         self.env_name = env_name
         self.env_num = env_num
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
-
-        self.max_steps = self.envs.envs[0].spec.max_episode_steps
-        self.rollout_steps = 50
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.env_name = env_name
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+        # Record the real terminal observation, then explicitly reset finished envs.
+        self.envs = gymnasium.vector.SyncVectorEnv(
+            [lambda: self.setup_env(env_name) for _ in range(env_num)],
+            autoreset_mode=gymnasium.vector.AutoresetMode.DISABLED,
+        )
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = 50
@@ -74,7 +75,8 @@ class Trainer:
         self.replay_buffer.create_storage_space("log_probs", (), torch.float32)
         self.replay_buffer.create_storage_space("rewards", (), torch.float32)
         self.replay_buffer.create_storage_space("values", (), torch.float32)
-        self.replay_buffer.create_storage_space("dones", (), torch.float32)
+        self.replay_buffer.create_storage_space("terminated", (), torch.bool)
+        self.replay_buffer.create_storage_space("truncated", (), torch.bool)
 
         self.expert_buffer = ReplayBuffer(env_num, 1000, device=self.device)
         self.expert_buffer.load("AMP/HalfCheetah-v5_expert_data.pth", device=self.device)
@@ -115,6 +117,7 @@ class Trainer:
         
         return action, log_prob, value
     
+    @torch.no_grad()
     def get_style_reward(self, obs:np.ndarray, next_obs:np.ndarray):
         obs = torch.from_numpy(obs).float().to(self.device)
         next_obs = torch.from_numpy(next_obs).float().to(self.device)
@@ -126,14 +129,25 @@ class Trainer:
         return style_reward
     
     
+    @torch.no_grad()
+    def timeout_rewards(self, rewards:torch.Tensor, next_obs:np.ndarray, terminated:np.ndarray, truncated:np.ndarray):
+        rewards = rewards.clone()
+        timeouts = truncated & ~terminated
+        if timeouts.any():
+            observations = torch.from_numpy(next_obs[timeouts]).float().to(self.device)
+            # next_obs is the real final observation because autoreset is disabled.
+            rewards[torch.from_numpy(timeouts).to(rewards.device)] += self.gamma * self.critic(observations).value
+        return rewards
+    
     def rollout(self):
         self.replay_buffer.reset()
         obs = self.obs
         for i in range(self.rollout_steps):
             self.global_step += self.env_num
             action, log_prob, value = self.get_action(obs)
-            next_obs, task_reward, done, timeout, info = self.envs.step(action.numpy())
+            next_obs, task_reward, terminated, truncated, info = self.envs.step(action.cpu().numpy())
             style_reward = self.get_style_reward(obs, next_obs)
+            style_reward = self.timeout_rewards(style_reward, next_obs, terminated, truncated)
             
             record = {
                 "observations": obs,
@@ -142,7 +156,8 @@ class Trainer:
                 "log_probs": log_prob,
                 "rewards": style_reward,
                 "values": value,
-                "dones": done
+                "terminated": terminated,
+                "truncated": truncated
             }
 
             agent_record = {
@@ -153,26 +168,25 @@ class Trainer:
             self.replay_buffer.add_records(record)
             self.agent_buffer.add_records(agent_record)
             
-            obs = next_obs
-            
-            if "episode" in info:
-                finished = info['episode']['_r']
-                episode_info = {}
-                episode_info['episode/mean_rewards'] = np.mean(info['episode']['r'][finished])
-                episode_info['episode/mean_length'] = np.mean(info['episode']['l'][finished])
-                
+            episode_info = episode_metrics(info)
+            if episode_info:
                 WandbLogger.log_metrics(episode_info, self.global_step)
+
+            obs = reset_finished_envs(self.envs, next_obs, terminated, truncated)
                 
         self.obs = obs
         _, _, value = self.get_action(obs)
         buffer_steps = self.replay_buffer.current_size
         returns, advantages = compute_gae(
-            self.replay_buffer.data["rewards"][:buffer_steps],
-            self.replay_buffer.data["values"][:buffer_steps],
-            self.replay_buffer.data["dones"][:buffer_steps],
-            value,
-            self.gamma,
-            self.lambda_
+            rewards=self.replay_buffer.data["rewards"][:buffer_steps],
+            values=self.replay_buffer.data["values"][:buffer_steps],
+            terminated=self.replay_buffer.data["terminated"][:buffer_steps],
+            last_values=value,
+            gamma=self.gamma,
+            lambda_=self.lambda_,
+            truncated=self.replay_buffer.data["truncated"][:buffer_steps],
+            # Timeout rewards already bootstrap from V(final_obs).
+            bootstrap_timeouts=False,
             )
 
         returns_full = torch.zeros_like(self.replay_buffer.data["rewards"])
@@ -200,13 +214,16 @@ class Trainer:
                 return_batch = batch["returns"].to(self.device)
                 advantage_batch = batch["advantages"].to(self.device)
 
-                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_prob_batch, obs_batch, action_batch, advantage_batch, self.clip_ratio, self.regularization_weight)
+                policy_loss_dict = PPO.compute_policy_loss(self.actor, log_probs_hat=log_prob_batch, observations=obs_batch, actions=action_batch,
+                                                           advantages=advantage_batch, clip_ratio=self.clip_ratio,
+                                                           regularization_weight=self.regularization_weight)
 
                 policy_loss = policy_loss_dict["loss"]
                 entropy = policy_loss_dict["entropy"]
                 kl_divergence = policy_loss_dict["kl_divergence"]
 
-                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, obs_batch, value_batch, return_batch, self.clip_ratio)
+                value_loss_dict = PPO.compute_clipped_value_loss(self.critic, observations=obs_batch, values_hat=value_batch,
+                                                                returns=return_batch, clip_ratio=self.clip_ratio)
                 value_loss = value_loss_dict["loss"]
 
                 ac_loss = policy_loss + value_loss * self.value_loss_weight - entropy * self.entropy_weight
@@ -234,7 +251,7 @@ class Trainer:
                 agent_d_history_obs_batch = torch.cat([agent_history_obs_batch, agent_history_next_obs_batch], dim=1)
                 agent_d_obs_batch = torch.cat([agent_d_current_obs_batch, agent_d_history_obs_batch], dim=0)
 
-                d_loss_dict = GAN.compute_bce_loss(self.discriminator, expert_d_obs_batch, agent_d_obs_batch, r1_gamma=5.0)
+                d_loss_dict = GAN.compute_bce_loss(self.discriminator, real_data=expert_d_obs_batch, fake_data=agent_d_obs_batch, r1_gamma=5.0)
                 d_loss = d_loss_dict["loss"]
                 d_loss_real = d_loss_dict["loss_real"]
                 d_loss_fake = d_loss_dict["loss_fake"]
@@ -297,3 +314,4 @@ if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 20)
     
     trainer.train(total_frames=100_000, num_iteration=10, batch_size=500)
+    save_checkpoint(trainer, default_checkpoint_path("AMP", "HalfCheetah-v5", 0), algorithm="AMP", env_name="HalfCheetah-v5", seed=0)

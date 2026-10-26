@@ -37,7 +37,10 @@ def evaluate(trainer, episodes=4):
         while active.any():
             observations = torch.as_tensor(obs, dtype=torch.float32, device=trainer.device)
             noise = torch.randn(episodes, trainer.max_action.numel(), generator=rng, device=trainer.device)
-            step = FPO.sample_actions(trainer.actor, observations, noise, trainer.flow_steps, deterministic=True)
+            step = FPO.sample_actions(
+                trainer.actor, observations=observations, init_noise=noise, flow_steps=trainer.flow_steps,
+                deterministic=True,
+            )
             actions = (torch.tanh(step.action) * trainer.max_action).cpu().numpy()
             obs, reward, terminated, truncated, _ = envs.step(actions)
             totals += reward * active

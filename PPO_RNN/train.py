@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import Optional
 
 from tqdm import trange
@@ -9,7 +11,7 @@ import gymnasium
 import numpy as np
 
 from RLAlg.alg.ppo import PPO
-from RLAlg.buffer.replay_buffer import ReplayBuffer, compute_gae
+from RLAlg.buffer import ReplayBuffer, compute_gae
 from RLAlg.nn.steps import StochasticContinuousPolicyStep, ValueStep
 from RLAlg.utils import set_seed_everywhere
 from RLAlg.logger import WandbLogger
@@ -18,6 +20,9 @@ try:
     from .model import ContinuousActor, Critic, Encoder
 except ImportError:
     from model import ContinuousActor, Critic, Encoder
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from demo_utils import default_checkpoint_path, reset_finished_envs, save_checkpoint
 
 class Trainer:
     def __init__(self, env_name:str, env_num:int, seed:int=0, gru_num_layers:int=1):
@@ -28,7 +33,12 @@ class Trainer:
 
         self.env_name = env_name
         self.env_num = env_num
-        self.envs = gymnasium.vector.SyncVectorEnv([lambda: self.setup_env(env_name) for _ in range(env_num)])
+        # Disable gymnasium 1.x NEXT_STEP autoreset: finished envs are reset explicitly after
+        # recording the real final observation, so no terminal->reset transition is stored.
+        self.envs = gymnasium.vector.SyncVectorEnv(
+            [lambda: self.setup_env(env_name) for _ in range(env_num)],
+            autoreset_mode=gymnasium.vector.AutoresetMode.DISABLED,
+        )
 
         self.max_steps = self.envs.envs[0].spec.max_episode_steps
         self.rollout_steps = 50
@@ -65,6 +75,7 @@ class Trainer:
         self.replay_buffer.create_storage_space("values", (), torch.float32)
         self.replay_buffer.create_storage_space("dones", (), torch.float32)
         self.replay_buffer.create_storage_space("terminated", (), torch.float32)
+        self.replay_buffer.create_storage_space("truncated", (), torch.bool)
         
         self.batch_keys = ["observations", "actions", "log_probs", "values", "returns", "advantages", "dones"]
         
@@ -98,6 +109,20 @@ class Trainer:
         value = value_step.value
         
         return action, log_prob, value, next_hidden
+
+    @torch.no_grad()
+    def timeout_rewards(self, rewards:np.ndarray, next_obs:np.ndarray, next_hidden:torch.Tensor,
+                        terminated:np.ndarray, truncated:np.ndarray) -> np.ndarray:
+        # Timeouts end the episode for GAE but bootstrap from V(real final observation),
+        # evaluated with the episode's hidden state before it is reset.
+        rewards = np.array(rewards, copy=True)
+        timeouts = truncated & ~terminated
+        if timeouts.any():
+            mask = torch.as_tensor(timeouts, device=self.device)
+            final_obs = torch.from_numpy(next_obs[timeouts]).float().to(self.device)
+            feat, _ = self.encoder(final_obs, next_hidden[mask])
+            rewards[timeouts] += self.gamma * self.critic(feat).value.cpu().numpy()
+        return rewards
     
     def rollout(self):
         self.replay_buffer.reset()
@@ -113,15 +138,18 @@ class Trainer:
                 "hiddens": self.hidden,
                 "actions": action,
                 "log_probs": log_prob,
-                "rewards": reward,
+                "rewards": self.timeout_rewards(reward, next_obs, next_hidden, terminate, timeout),
                 "values": value,
                 "dones": done,
-                "terminated": terminate
+                "terminated": terminate,
+                "truncated": timeout
             }
             
             self.replay_buffer.add_records(record)
             
-            obs = next_obs
+            # Finished envs are reset now, so obs[t+1] starts a new episode with a zero hidden
+            # state; this matches episode_starts[t+1] = dones[t] used in update().
+            obs = reset_finished_envs(self.envs, next_obs, terminate, timeout)
             self.hidden = next_hidden
             done_tensor = torch.as_tensor(done, dtype=torch.bool, device=self.device)
             self.hidden[done_tensor] = torch.zeros_like(self.hidden[done_tensor])
@@ -139,12 +167,15 @@ class Trainer:
         _, _, value, _ = self.get_action(obs)
         buffer_steps = self.replay_buffer.current_size
         returns, advantages = compute_gae(
-            self.replay_buffer.data["rewards"][:buffer_steps],
-            self.replay_buffer.data["values"][:buffer_steps],
-            self.replay_buffer.data["terminated"][:buffer_steps],
-            value,
-            self.gamma,
-            self.lambda_
+            rewards=self.replay_buffer.data["rewards"][:buffer_steps],
+            values=self.replay_buffer.data["values"][:buffer_steps],
+            terminated=self.replay_buffer.data["terminated"][:buffer_steps],
+            last_values=value,
+            gamma=self.gamma,
+            lambda_=self.lambda_,
+            truncated=self.replay_buffer.data["truncated"][:buffer_steps],
+            # Timeout rewards already include gamma * V(final_obs).
+            bootstrap_timeouts=False,
             )
 
         returns_full = torch.zeros_like(self.replay_buffer.data["rewards"])
@@ -191,12 +222,12 @@ class Trainer:
 
                 policy_loss_dict = PPO.compute_policy_loss(
                     self.actor,
-                    log_prob_batch,
-                    feat_batch,
-                    action_batch,
-                    advantage_batch,
-                    self.clip_ratio,
-                    self.regularization_weight,
+                    log_probs_hat=log_prob_batch,
+                    observations=feat_batch,
+                    actions=action_batch,
+                    advantages=advantage_batch,
+                    clip_ratio=self.clip_ratio,
+                    regularization_weight=self.regularization_weight,
                 )
                 policy_loss = policy_loss_dict["loss"]
                 entropy = policy_loss_dict["entropy"]
@@ -204,10 +235,10 @@ class Trainer:
 
                 value_loss_dict = PPO.compute_clipped_value_loss(
                     self.critic,
-                    feat_batch,
-                    value_batch,
-                    return_batch,
-                    self.clip_ratio,
+                    observations=feat_batch,
+                    values_hat=value_batch,
+                    returns=return_batch,
+                    clip_ratio=self.clip_ratio,
                 )
                 value_loss = value_loss_dict["loss"]
                 
@@ -244,6 +275,7 @@ class Trainer:
         if total_frames <= 0:
             raise ValueError(f"total_frames must be positive, got {total_frames}.")
         self.obs, _ = self.envs.reset(seed=[i+self.seed for i in range(self.envs.num_envs)])
+        self.hidden = self.encoder.init_hidden(self.env_num, device=self.device)
         start_step = self.global_step
         target_step = start_step + total_frames
         frames_per_rollout = self.env_num * self.rollout_steps
@@ -271,3 +303,4 @@ if __name__ == "__main__":
     trainer = Trainer("HalfCheetah-v5", 20, seed=100, gru_num_layers=2)
     
     trainer.train(total_frames=100_000, num_iteration=10, batch_size=500)
+    save_checkpoint(trainer, default_checkpoint_path("PPO_RNN", "HalfCheetah-v5", 100), algorithm="PPO_RNN", env_name="HalfCheetah-v5", seed=100)

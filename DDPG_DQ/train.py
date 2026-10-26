@@ -89,8 +89,7 @@ class Trainer:
         if random:
             return self.envs.action_space.sample()
         observations = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        step = self.actor(observations, self.std)
-        action = step.pi.rsample()
+        action = DDPGDoubleQ.perturb_action(self.actor(observations), self.std)
         action = torch.clamp(action, -self.max_action, self.max_action)
         return action.cpu().numpy()
 
@@ -132,8 +131,11 @@ class Trainer:
             done_batch = batch["dones"].to(self.device)
 
             self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_result = DDPGDoubleQ.compute_critic_loss(self.actor, self.critic, self.critic_target,
-                                                   obs_batch, action_batch, reward_batch, next_obs_batch, done_batch, std=self.std, gamma=self.gamma)
+            critic_result = DDPGDoubleQ.compute_critic_loss(
+                self.actor, self.critic, self.critic_target,
+                observations=obs_batch, actions=action_batch, rewards=reward_batch,
+                next_observations=next_obs_batch, terminated=done_batch, std=self.std, gamma=self.gamma,
+            )
             critic_loss = critic_result["loss"]
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
@@ -143,7 +145,10 @@ class Trainer:
                 param.requires_grad = False
 
             self.actor_optimizer.zero_grad(set_to_none=True)
-            policy_result = DDPGDoubleQ.compute_policy_loss(self.actor, self.critic, obs_batch.detach(), self.std, self.regularization_weight)
+            policy_result = DDPGDoubleQ.compute_policy_loss(
+                self.actor, self.critic, observations=obs_batch.detach(), std=self.std,
+                regularization_weight=self.regularization_weight,
+            )
             policy_loss = policy_result["loss"]
             policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
