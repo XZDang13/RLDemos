@@ -8,6 +8,7 @@ import torch
 from demo_utils import checkpoint_state, default_checkpoint_path, load_checkpoint, save_checkpoint
 from IQL.collect import collect_dataset
 from IQL.train import Trainer as IQLTrainer
+from AHAC.train import Trainer as AHACTrainer
 from SHAC.train import Trainer as SHACTrainer
 from test_demos import OFF_POLICY, trainer_for
 from test_shac_demo import PointMassEnv
@@ -87,6 +88,26 @@ def test_shac_checkpoint_round_trip(tmp_path):
     assert {"actor", "critic", "critic_target", "obs_normalizer"} <= torch.load(path)["state"].keys()
     assert_round_trip(trained, fresh, path)
     assert trained.obs_normalizer.count.item() > 0
+
+
+def test_ahac_checkpoint_round_trip_keeps_adapted_horizon(tmp_path):
+    def make(seed):
+        probe = lambda env: (env.state.detach().unsqueeze(1) * 1e4, torch.ones(env.num_envs, 1, env.num_obs))
+        return AHACTrainer("PointMass", 4, seed=seed, min_horizon=4, max_horizon=12, device="cpu",
+                           env=PointMassEnv(), contact_probe=probe)
+
+    trained, fresh = make(0), make(1)
+    trained.current_horizon_lr = 1e-2
+    rollout, _ = trained.rollout()
+    trained.update_actor(rollout)
+    trained.update_critic(rollout)
+    trained.update_horizon(rollout)
+    path = save_checkpoint(trained, tmp_path / "ckpt.pt")
+
+    assert {"actor", "critic", "obs_normalizer", "horizon", "dual"} <= torch.load(path)["state"].keys()
+    assert_round_trip(trained, fresh, path)
+    assert fresh.horizon == trained.horizon > 4.0
+    torch.testing.assert_close(fresh.dual, trained.dual)
 
 
 def test_dsact_running_std_statistics_are_checkpointed(tmp_path):

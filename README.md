@@ -18,6 +18,7 @@ RLAlg checkout containing these interfaces are required.
 | `FPO` | Flow Policy Optimization | Online rollouts with stored CMF sampling targets | Box |
 | `IQL` | Implicit Q-Learning | Fixed offline `.npz` dataset | Box |
 | `SHAC` | Short-Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
+| `AHAC` | Adaptive Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 
 Box action spaces must be one-dimensional, finite, and symmetric around zero.
 Observations are flattened with `FlattenObservation`. These examples use MLPs
@@ -186,6 +187,55 @@ after the first few hundred epochs.
 
 `Trainer(..., env=...)` accepts any object with the same API. The tests use this
 with a differentiable point-mass environment, so they run without Rewarped.
+
+## AHAC differentiable simulation example
+
+AHAC uses the same Rewarped environment and rollout loop as SHAC (install it as
+above), with three changes from the
+[reference implementation](https://github.com/imgeorgiev/DiffRL):
+
+- The rollout horizon adapts between 8 and 64 steps. After each epoch,
+  `AHAC.update_horizon` moves dual variables by how far the per-step contact
+  stiffness sits above or below `C = 500` and moves the horizon by their sum
+  with a learning rate of `5e-4`, decayed linearly to `1e-5`. As in the
+  reference, contact above the threshold lengthens the horizon.
+- Next values come from `min(V1, V2)` of a live double critic; there is no
+  target critic.
+- The critic trains on 4 minibatches per epoch until the epoch loss stops
+  changing (`AHAC.critic_converged`), for at most 64 epochs. Non-finite critic
+  gradients are zeroed, as in the reference.
+
+The other defaults match the SHAC demo: 128 environments, `[400, 200, 100]` ELU
+networks, actor/critic learning rates `2e-3` and `5e-4`, Adam betas `(0.7, 0.95)`,
+TD(λ=0.95) targets, and actor gradient clipping at 1.0.
+
+```bash
+python -m AHAC.train --env Ant --epochs 2000
+python -m AHAC.train --env Ant --env-num 16 --epochs 3  # quick check
+```
+
+Rewarped does not report contact forces, so [contact.py](AHAC/contact.py) wraps
+the Featherstone integrator's `simulate` and reads the last substep's rigid
+contact forces (`body_f`) and body accelerations (`body_a_s`). It keeps state
+references, so it also works with CUDA graph capture. The contact norm is
+`||forces / max(accelerations, 1)||` over all bodies. Only the linear parts are
+used, because Warp expresses wrenches about the world origin and Rewarped
+spaces environments apart, which would make the torque parts depend on an
+environment's position. The probe requires the Featherstone integrator, which
+all six DFlex tasks use.
+The horizon and dual variables are saved in the checkpoint.
+
+A default Ant run with seed 0 (2000 epochs, 14.6M steps, about 137 minutes on an
+RTX 3090) raised the mean training return from about 1170 over the first 200
+logged epochs to about 1240 over the last 200, with a peak of about 2200. On
+this seed it ended below the SHAC demo's 1500. The horizon stayed at 8 while the
+contact norm was below the threshold, then grew once the gait made stiffer
+contact, reaching the 64-step maximum after about 0.7M steps and staying there.
+Epochs at the full horizon take about 4-5 seconds.
+
+`Trainer(..., env=..., contact_probe=...)` accepts any environment with the
+SHAC demo's API and a callable that returns `(contact_forces, accelerations)`.
+The tests use the point-mass environment with a synthetic probe.
 
 ## IQL offline example
 

@@ -17,6 +17,7 @@
 | `FPO` | Flow Policy Optimization | 在线 rollout，保存 CMF 采样目标 | Box |
 | `IQL` | Implicit Q-Learning | 固定离线 `.npz` 数据集 | Box |
 | `SHAC` | Short-Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
+| `AHAC` | Adaptive Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 
 Box 动作空间目前要求一维、有限且关于 0 对称。观测通过 `FlattenObservation`
 展平；例子使用 MLP，不面向像素观测。各 `model.py` 展示网络，`train.py` 展示训练流程。
@@ -154,6 +155,44 @@ python -m SHAC.train --env Ant --env-num 16 --epochs 3 --horizon 8  # 快速检�
 
 `Trainer(..., env=...)` 可以接收任何接口相同的环境对象。测试用它接入一个可微的点质量环境，
 因此不装 Rewarped 也能运行。
+
+## AHAC 可微仿真例子
+
+AHAC 与 SHAC 使用相同的 Rewarped 环境和 rollout 流程（按上文安装），
+相对 [参考实现](https://github.com/imgeorgiev/DiffRL) 有三处不同于 SHAC：
+
+- rollout 视界在 8 到 64 步之间自适应。每个 epoch 结束后，`AHAC.update_horizon`
+  根据每一步接触刚度高于或低于 `C = 500` 的程度更新对偶变量，再按其总和调整视界，
+  学习率为 `5e-4` 并线性衰减到 `1e-5`。与参考实现一致，接触超过阈值时视界变长。
+- 下一状态价值取在线双 critic 的 `min(V1, V2)`，没有目标 critic。
+- critic 每个 epoch 用 4 个 minibatch 训练，直到 epoch 损失不再变化
+  （`AHAC.critic_converged`），最多 64 个 epoch。与参考实现一样，critic 的非有限梯度会被置零。
+
+其他默认值与 SHAC 例子相同：128 个环境、`[400, 200, 100]` 的 ELU 网络、
+actor/critic 学习率 `2e-3` 和 `5e-4`、Adam betas `(0.7, 0.95)`、TD(λ=0.95) 目标，
+以及 1.0 的 actor 梯度裁剪。
+
+```bash
+python -m AHAC.train --env Ant --epochs 2000
+python -m AHAC.train --env Ant --env-num 16 --epochs 3  # 快速检查
+```
+
+Rewarped 不提供接触力，因此 [contact.py](AHAC/contact.py) 包装 Featherstone 积分器的
+`simulate`，读取最后一个子步的刚体接触力（`body_f`）和刚体加速度（`body_a_s`）。
+它只保存状态引用，所以在 CUDA graph capture 下也能工作。
+接触范数是所有刚体上的 `||forces / max(accelerations, 1)||`。
+这里只使用线性分量：Warp 的力矩以世界原点为参考，而 Rewarped 会把各环境错开摆放，
+力矩分量因此会依赖环境的位置。该探针要求使用 Featherstone 积分器，六个 DFlex 任务都满足这一点。
+视界和对偶变量会保存到 checkpoint 中。
+
+用 seed 0 的默认 Ant 训练（2000 个 epoch、1460 万步，RTX 3090 上约 137 分钟）中，
+前 200 个记录的 epoch 的平均训练回报约 1170，最后 200 个约 1240，峰值约 2200。
+在这个 seed 上最终结果低于 SHAC 例子的 1500。接触范数低于阈值时视界保持为 8，
+步态形成、接触变硬后视界开始增长，约 70 万步后达到 64 步上限并一直保持。
+满视界时每个 epoch 约需 4-5 秒。
+
+`Trainer(..., env=..., contact_probe=...)` 可以接收接口与 SHAC 例子相同的环境，
+以及返回 `(contact_forces, accelerations)` 的可调用对象。测试用点质量环境和合成探针运行。
 
 ## IQL 离线例子
 
