@@ -19,6 +19,7 @@
 | `SHAC` | Short-Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 | `AHAC` | Adaptive Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 | `SAPO` | Soft Analytic Policy Optimization | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
+| `RPO` | Reparameterization Proximal Policy Optimization | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 
 Box 动作空间目前要求一维、有限且关于 0 对称。观测通过 `FlattenObservation`
 展平；例子使用 MLP，不面向像素观测。各 `model.py` 展示网络，`train.py` 展示训练流程。
@@ -222,6 +223,35 @@ python -m SAPO.train --env Ant --env-num 16 --epochs 3  # 快速检查
 前 200 个记录的 epoch 的平均训练回报约 1220，最后 200 个约 4780，峰值约 5480。
 这明显高于 SHAC（约 1500）和 AHAC（约 1240）例子，但它们的步数（820 万和 1460 万）和网络都不同。
 温度先从 1 降到约 0.27，之后在熵稳定于目标值 -4 附近时维持在 0.4-0.5 左右。
+
+## RPO 可微仿真例子
+
+RPO（[Zhong 等，ICML 2026](https://arxiv.org/abs/2508.06214)）与 SHAC 使用相同的
+Rewarped 环境和 rollout 流程（按上文安装）。论文没有公开代码，因此设置遵循论文中 Ant 的超参数（表 2-4）：
+
+- 每个 epoch 对 SAPO 式 rollout 只做一次反向传播，缓存软回报对每个动作的梯度，
+  随后 5 个策略 epoch 复用它。每个 epoch 用当前策略重新生成存储的动作，
+  每个缓存梯度乘以 `pi / pi_old`，比率超出 `[0.2, 2.0]` 时置零（`clip_low = 0.8`、`clip_high = 1.0`）。
+  `0.25 * KL(pi_old || pi)` 惩罚让策略贴近行为策略。第一个 epoch 是同策略的，等于 SAPO/SHAC 梯度。
+- 熵系数 `0.2` 是固定的 SAPO 温度：奖励加上 `0.2 * normalized_entropy`（目标熵 `-0.5 * action_dim`），
+  不自动调节温度。
+- 两个在线 critic。按论文所述，策略 bootstrap 和 TD(λ) 目标都用它们的均值（SAPO 的目标用最小值）。
+- 128 个环境、视界 32、2500 个 epoch（1020 万步，与 SAPO 例子的步数相同）。
+  actor 沿用 SAPO 的 tanh 压缩高斯，actor 和两个 critic 都是 LayerNorm + SiLU 的 `[400, 200, 100]` 网络。
+  AdamW 的 betas 为 `(0.7, 0.95)`，两者学习率都是 `5e-4`，按指数衰减到 `1e-5`（论文只给出调度类型，没给衰减率）。
+  梯度范数裁剪到 0.5，critic 训练 16 个 epoch、每个 4 个 minibatch。
+  动作梯度出现非有限值的 rollout 会跳过该次策略更新。
+
+```bash
+python -m RPO.train --env Ant
+python -m RPO.train --env Ant --env-num 16 --epochs 3  # 快速检查
+```
+
+用 seed 0 的默认 Ant 训练（2500 个 epoch、1020 万步，RTX 3090 上约 84 分钟）中，
+前 200 个记录的 epoch 的平均训练回报约 2400，最后 200 个约 5730，峰值约 6040。
+步数相同时高于 SAPO 例子（约 4780），但环境数是其两倍，网络也更大。
+五个策略 epoch 后相对行为策略的 KL 从早期约 0.12 降到约 0.03，训练后期被截断的样本不到 1%。
+固定温度不会把熵维持在目标值：熵从约 -5 降到约 -25（目标为 -4）。没有跳过任何策略更新。
 
 ## IQL 离线例子
 

@@ -9,6 +9,7 @@ from demo_utils import checkpoint_state, default_checkpoint_path, load_checkpoin
 from IQL.collect import collect_dataset
 from IQL.train import Trainer as IQLTrainer
 from AHAC.train import Trainer as AHACTrainer
+from RPO.train import Trainer as RPOTrainer
 from SAPO.train import Trainer as SAPOTrainer
 from SHAC.train import Trainer as SHACTrainer
 from test_demos import OFF_POLICY, trainer_for
@@ -125,6 +126,20 @@ def test_sapo_checkpoint_round_trip_keeps_temperature(tmp_path):
     assert {"actor", "critic", "obs_normalizer", "log_alpha", "alpha_optimizer"} <= torch.load(path)["state"].keys()
     assert_round_trip(trained, fresh, path)
     assert fresh.alpha == trained.alpha != 1.0
+
+
+def test_rpo_checkpoint_round_trip(tmp_path):
+    def make(seed):
+        return RPOTrainer("PointMass", 4, seed=seed, horizon=4, device="cpu", env=PointMassEnv())
+
+    trained, fresh = make(0), make(1)
+    rollout, _ = trained.rollout()
+    trained.update_actor(rollout)
+    trained.update_critic(rollout)
+    path = save_checkpoint(trained, tmp_path / "ckpt.pt")
+
+    assert {"actor", "critic", "obs_normalizer", "actor_optimizer", "critic_optimizer"} <= torch.load(path)["state"].keys()
+    assert_round_trip(trained, fresh, path)
 
 
 def test_dsact_running_std_statistics_are_checkpointed(tmp_path):

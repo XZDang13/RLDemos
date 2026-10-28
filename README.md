@@ -20,6 +20,7 @@ RLAlg checkout containing these interfaces are required.
 | `SHAC` | Short-Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 | `AHAC` | Adaptive Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 | `SAPO` | Soft Analytic Policy Optimization | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
+| `RPO` | Reparameterization Proximal Policy Optimization | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 
 Box action spaces must be one-dimensional, finite, and symmetric around zero.
 Observations are flattened with `FlattenObservation`. These examples use MLPs
@@ -273,6 +274,47 @@ is well above the SHAC (about 1500) and AHAC (about 1240) demos, though those
 used fewer steps (8.2M and 14.6M) and different networks. The temperature fell
 from 1 to about 0.27 early on, then settled near 0.4-0.5 as the entropy held
 near its target of -4.
+
+## RPO differentiable simulation example
+
+RPO ([Zhong et al., ICML 2026](https://arxiv.org/abs/2508.06214)) uses the same
+Rewarped environment and rollout loop as SHAC (install it as above). The paper
+releases no code, so the settings follow its Ant hyperparameters (Tables 2-4):
+
+- Each epoch backpropagates once through a SAPO-style rollout and caches the
+  gradient of the soft return with respect to every action. Five policy epochs
+  then reuse it. Each epoch regenerates the stored actions under the current
+  policy, weights each cached gradient by `pi / pi_old`, and zeroes it when that
+  ratio leaves `[0.2, 2.0]` (`clip_low = 0.8`, `clip_high = 1.0`). A
+  `0.25 * KL(pi_old || pi)` penalty keeps the policy near the behavior policy.
+  The first epoch is on-policy and equals the SAPO/SHAC gradient.
+- The entropy coefficient `0.2` is a fixed SAPO temperature: rewards gain
+  `0.2 * normalized_entropy` against the target `-0.5 * action_dim`, with no
+  temperature tuning.
+- Two live critics. Both the policy bootstrap and the TD(λ) targets use their
+  mean, as the paper states (SAPO's targets use the minimum).
+- 128 environments, horizon 32, and 2500 epochs (10.2M steps, the SAPO demo's
+  budget). The SAPO tanh-squashed actor and both critics are LayerNorm SiLU
+  `[400, 200, 100]` networks. AdamW with betas `(0.7, 0.95)` and learning rate
+  `5e-4` for both, decayed exponentially to `1e-5` (the paper names the schedule
+  but not its rate). Gradient norms are clipped at 0.5, and the critic trains
+  for 16 epochs of 4 minibatches. A rollout with non-finite action gradients
+  skips its policy update.
+
+```bash
+python -m RPO.train --env Ant
+python -m RPO.train --env Ant --env-num 16 --epochs 3  # quick check
+```
+
+A default Ant run with seed 0 (2500 epochs, 10.2M steps, about 84 minutes on an
+RTX 3090) raised the mean training return from about 2400 over the first 200
+logged epochs to about 5730 over the last 200, with a peak of about 6040. That is
+above the SAPO demo (about 4780) with the same number of steps, though with
+twice the environments and larger networks. The KL to the behavior policy after
+the five epochs fell from about 0.12 early on to about 0.03, and under 1% of
+samples were clipped late in training. The fixed temperature does not hold the
+entropy at its target: it fell from about -5 to about -25 (target -4). No policy
+update was skipped.
 
 ## IQL offline example
 
