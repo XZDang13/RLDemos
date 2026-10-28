@@ -18,6 +18,7 @@
 | `IQL` | Implicit Q-Learning | 固定离线 `.npz` 数据集 | Box |
 | `SHAC` | Short-Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 | `AHAC` | Adaptive Horizon Actor-Critic | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
+| `SAPO` | Soft Analytic Policy Optimization | 可微 Rewarped/DFlex rollout | `[-1, 1]` 内的 Box |
 
 Box 动作空间目前要求一维、有限且关于 0 对称。观测通过 `FlattenObservation`
 展平；例子使用 MLP，不面向像素观测。各 `model.py` 展示网络，`train.py` 展示训练流程。
@@ -193,6 +194,34 @@ Rewarped 不提供接触力，因此 [contact.py](AHAC/contact.py) 包装 Feathe
 
 `Trainer(..., env=..., contact_probe=...)` 可以接收接口与 SHAC 例子相同的环境，
 以及返回 `(contact_forces, accelerations)` 的可调用对象。测试用点质量环境和合成探针运行。
+
+## SAPO 可微仿真例子
+
+SAPO 与 SHAC 使用相同的 Rewarped 环境和 rollout 流程（按上文安装），
+设置遵循 [参考的 DFlex Ant 配置](https://github.com/etaoxing/mineral)：
+
+- 每个奖励都加上 `alpha * normalized_entropy`，同时用于策略回报和 TD(λ) 目标。
+  熵用 tanh 压缩动作的单样本估计 `-log_prob`。
+- 每次 actor 更新后，`alpha`（初始为 1）用 AdamW 以固定学习率 `5e-3`
+  朝目标熵 `-0.5 * action_dim` 调整，critic 目标使用更新后的 `alpha`。
+- 两个在线 critic，没有目标 critic：策略用它们的均值做 bootstrap，目标用它们的最小值。
+- 64 个环境、视界 32、5000 个 epoch（1020 万步）。actor 是 LayerNorm + SiLU 的
+  `[128, 64, 32]` 网络，log-std 依赖状态且限制在 `[-5, 2]`；每个 critic 为 `[64, 64]`。
+  AdamW 的 betas 为 `(0.7, 0.95)`，学习率 `2e-3`（actor）和 `5e-4`（critic），都线性衰减到 `1e-5`。
+  梯度范数裁剪到 0.5，critic 固定训练 16 个 epoch、每个 4 个 minibatch。
+  与参考实现一样，critic 的非有限梯度会被置零。
+
+```bash
+python -m SAPO.train --env Ant
+python -m SAPO.train --env Ant --env-num 16 --epochs 3  # 快速检查
+```
+
+温度及其优化器会保存到 checkpoint 中。
+
+用 seed 0 的默认 Ant 训练（5000 个 epoch、1020 万步，RTX 3090 上约 123 分钟）中，
+前 200 个记录的 epoch 的平均训练回报约 1220，最后 200 个约 4780，峰值约 5480。
+这明显高于 SHAC（约 1500）和 AHAC（约 1240）例子，但它们的步数（820 万和 1460 万）和网络都不同。
+温度先从 1 降到约 0.27，之后在熵稳定于目标值 -4 附近时维持在 0.4-0.5 左右。
 
 ## IQL 离线例子
 

@@ -19,6 +19,7 @@ RLAlg checkout containing these interfaces are required.
 | `IQL` | Implicit Q-Learning | Fixed offline `.npz` dataset | Box |
 | `SHAC` | Short-Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 | `AHAC` | Adaptive Horizon Actor-Critic | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
+| `SAPO` | Soft Analytic Policy Optimization | Differentiable Rewarped/DFlex rollouts | Box in `[-1, 1]` |
 
 Box action spaces must be one-dimensional, finite, and symmetric around zero.
 Observations are flattened with `FlattenObservation`. These examples use MLPs
@@ -236,6 +237,42 @@ Epochs at the full horizon take about 4-5 seconds.
 `Trainer(..., env=..., contact_probe=...)` accepts any environment with the
 SHAC demo's API and a callable that returns `(contact_forces, accelerations)`.
 The tests use the point-mass environment with a synthetic probe.
+
+## SAPO differentiable simulation example
+
+SAPO uses the same Rewarped environment and rollout loop as SHAC (install it as
+above). Its settings follow the
+[reference DFlex Ant config](https://github.com/etaoxing/mineral):
+
+- Every reward gains `alpha * normalized_entropy` in both the policy return and
+  the TD(λ) targets. The entropy is the one-sample estimate `-log_prob` of the
+  tanh-squashed action.
+- After each actor step, `alpha` (initially 1) moves toward the target entropy
+  `-0.5 * action_dim` with AdamW at a constant learning rate of `5e-3`. The
+  critic targets use the updated `alpha`.
+- Two live critics, with no target critic. The policy bootstraps from their mean,
+  the targets from their minimum.
+- 64 environments, horizon 32, and 5000 epochs (10.2M steps). The actor is a
+  LayerNorm SiLU `[128, 64, 32]` network with state-dependent log-std in `[-5, 2]`;
+  each critic is `[64, 64]`. AdamW with betas `(0.7, 0.95)` and learning rates
+  `2e-3` (actor) and `5e-4` (critic), both decayed linearly to `1e-5`. Gradient
+  norms are clipped at 0.5, and the critic trains for a fixed 16 epochs of 4
+  minibatches. Non-finite critic gradients are zeroed, as in the reference.
+
+```bash
+python -m SAPO.train --env Ant
+python -m SAPO.train --env Ant --env-num 16 --epochs 3  # quick check
+```
+
+The temperature and its optimizer are saved in the checkpoint.
+
+A default Ant run with seed 0 (5000 epochs, 10.2M steps, about 123 minutes on an
+RTX 3090) raised the mean training return from about 1220 over the first 200
+logged epochs to about 4780 over the last 200, with a peak of about 5480. That
+is well above the SHAC (about 1500) and AHAC (about 1240) demos, though those
+used fewer steps (8.2M and 14.6M) and different networks. The temperature fell
+from 1 to about 0.27 early on, then settled near 0.4-0.5 as the entropy held
+near its target of -4.
 
 ## IQL offline example
 
