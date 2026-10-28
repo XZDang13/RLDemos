@@ -166,7 +166,7 @@ def test_double_q_passes_std_and_gamma_independently(monkeypatch):
     seen = {}
 
     def capture(*args, **kwargs):
-        seen.update(kwargs)
+        seen.update(kwargs, policy_model=args[0])
         return original(*args, **kwargs)
 
     monkeypatch.setattr(DDPGDoubleQ, "compute_critic_loss", capture)
@@ -178,6 +178,7 @@ def test_double_q_passes_std_and_gamma_independently(monkeypatch):
         trainer.rollout()
         trainer.update(1, 4)
         assert seen["std"] == 0.23 and seen["gamma"] == 0.8
+        assert seen["policy_model"] is trainer.actor_target
         assert {"observations", "actions", "rewards", "next_observations", "terminated"} <= seen.keys()
     finally:
         trainer.close()

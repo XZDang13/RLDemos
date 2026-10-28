@@ -52,11 +52,16 @@ class Trainer:
         obs_dim = int(np.prod(obs_space))
         action_dim = int(np.prod(action_space))
 
-        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
+        self.actor = Actor(obs_dim, action_dim, [256, 256], self.max_action).to(self.device)
+        self.critic = Critic(obs_dim, action_dim, [256, 256]).to(self.device)
+        self.actor_target = Actor(obs_dim, action_dim, [256, 256], self.max_action).to(self.device)
+        self.critic_target = Critic(obs_dim, action_dim, [256, 256]).to(self.device)
 
+        self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
+
+        for param in self.actor_target.parameters():
+            param.requires_grad = False
 
         for param in self.critic_target.parameters():
             param.requires_grad = False
@@ -77,7 +82,8 @@ class Trainer:
         self.regularization_weight = 0.0
         self.tau = 0.005
         self.max_grad_norm = 1.0
-        self.std = 1.0
+        # Fixed pre-tanh noise for exploration, target smoothing and the policy loss.
+        self.std = 0.2
 
         self.global_step = 0
         self.logger = DemoLogger(f"DDPG_DQ-{env_name}-{seed}", use_wandb)
@@ -132,7 +138,7 @@ class Trainer:
 
             self.critic_optimizer.zero_grad(set_to_none=True)
             critic_result = DDPGDoubleQ.compute_critic_loss(
-                self.actor, self.critic, self.critic_target,
+                self.actor_target, self.critic, self.critic_target,
                 observations=obs_batch, actions=action_batch, rewards=reward_batch,
                 next_observations=next_obs_batch, terminated=done_batch, std=self.std, gamma=self.gamma,
             )
@@ -157,6 +163,7 @@ class Trainer:
             for param in self.critic.parameters():
                 param.requires_grad = True
 
+            DDPGDoubleQ.update_target_param(self.actor, self.actor_target, self.tau)
             DDPGDoubleQ.update_target_param(self.critic, self.critic_target, self.tau)
 
             policy_loss_buffer.append(policy_loss.item())
@@ -182,9 +189,6 @@ class Trainer:
         for i in trange(num_epoch):
             self.rollout(random=i < max(1, num_epoch // 10))
             self.update(num_iteration, batch_size)
-
-            mix = np.clip(i/num_epoch, 0, 1)
-            self.std = (1-mix) * 1 + mix * 0.1
 
     def close(self):
         self.envs.close()

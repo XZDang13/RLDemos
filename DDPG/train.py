@@ -52,10 +52,10 @@ class Trainer:
         obs_dim = int(np.prod(obs_space))
         action_dim = int(np.prod(action_space))
 
-        self.actor = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
-        self.actor_target = Actor(obs_dim, action_dim, [128, 128], self.max_action).to(self.device)
-        self.critic_target = Critic(obs_dim, action_dim, [128, 128]).to(self.device)
+        self.actor = Actor(obs_dim, action_dim, [256, 256], self.max_action).to(self.device)
+        self.critic = Critic(obs_dim, action_dim, [256, 256]).to(self.device)
+        self.actor_target = Actor(obs_dim, action_dim, [256, 256], self.max_action).to(self.device)
+        self.critic_target = Critic(obs_dim, action_dim, [256, 256]).to(self.device)
 
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
